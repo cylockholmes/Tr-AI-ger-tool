@@ -32,7 +32,7 @@ import unittest
 import unittest.mock
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple, Union
 
 
 # ============================================================================
@@ -88,6 +88,19 @@ class InputError(Exception):
 
 
 def read_findings(path: Path) -> List[Dict[str, str]]:
+    """Read the findings CSV into one dict per row.
+
+    Fields can hold quoted commas and embedded newlines, so the file is parsed with the csv module in strict mode.
+
+    Args:
+        path: The input CSV.
+
+    Returns:
+        The rows in file order, keyed by column name.
+
+    Raises:
+        InputError: If the file is unreadable, empty, truncated or malformed, or repeats a finding_id.
+    """
     csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
     try:
         with open(path, newline="", encoding="utf-8-sig") as fh:
@@ -142,7 +155,7 @@ OUTPUT_COLUMNS = (
 )
 
 
-def _csv_cell(value) -> str:
+def _csv_cell(value: object) -> str:
     """Neutralise spreadsheet formula injection in untrusted text."""
     text = "" if value is None else str(value)
     return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
@@ -173,6 +186,12 @@ def write_filled_input(path: Path, source_csv: Path, results: List[Dict[str, obj
 
 
 def write_classified(path: Path, results: List[Dict[str, object]]) -> None:
+    """Write the per-finding results as the classified CSV, neutralising spreadsheet formulas.
+
+    Args:
+        path: Destination file.
+        results: Final per-finding results.
+    """
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=OUTPUT_COLUMNS, extrasaction="ignore")
         w.writeheader()
@@ -213,6 +232,17 @@ def roundup(value: float) -> float:
 
 
 def parse_vector(vector: str) -> Dict[str, str]:
+    """Split a CVSS 3.1 base vector into its metrics.
+
+    Args:
+        vector: A vector such as "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H".
+
+    Returns:
+        The metric abbreviations mapped to their values.
+
+    Raises:
+        CVSSError: If the text is not a CVSS 3.1 base vector.
+    """
     m = _VECTOR_RE.match((vector or "").strip())
     if not m:
         raise CVSSError(f"not a CVSS 3.1 base vector: {vector!r}")
@@ -220,6 +250,17 @@ def parse_vector(vector: str) -> Dict[str, str]:
 
 
 def base_score(vector: str) -> float:
+    """Compute the CVSS 3.1 base score from a vector, following the FIRST specification.
+
+    Args:
+        vector: A CVSS 3.1 base vector.
+
+    Returns:
+        The score from 0.0 to 10.0.
+
+    Raises:
+        CVSSError: If the vector is invalid.
+    """
     m = parse_vector(vector)
     scope_changed = m["S"] == "C"
     iss = 1 - (1 - _CIA[m["C"]]) * (1 - _CIA[m["I"]]) * (1 - _CIA[m["A"]])
@@ -237,6 +278,7 @@ def base_score(vector: str) -> float:
 
 
 def cvss_severity_label(score: float) -> str:
+    """Map a CVSS base score to its qualitative rating: None, Low, Medium, High or Critical."""
     if score == 0:
         return "None"
     if score < 4.0:
@@ -303,10 +345,12 @@ METADATA_FIELDS = frozenset(FIELD_ORDER[0][1] + FIELD_ORDER[1][1])
 
 
 def quotable_fields(row: Dict[str, str]) -> List[str]:
+    """List the row's columns that may be quoted as evidence, leaving out hidden answer columns and scanner metadata."""
     return [k for k in row if k not in HIDDEN_COLUMNS and k not in METADATA_FIELDS]
 
 
 def render_packet(row: Dict[str, str]) -> str:
+    """Render a row as the labelled evidence packet the models read, grouped by kind of evidence."""
     known = {f for _, fields in FIELD_ORDER for f in fields}
     groups = FIELD_ORDER + [("Other fields", [f for f in row if f not in known and f not in HIDDEN_COLUMNS])]
     out = []
@@ -332,6 +376,17 @@ def time_sort_key(row: Dict[str, str]) -> tuple:
 
 
 def extract_facts(row: Dict[str, str]) -> Dict[str, object]:
+    """Extract provenance and correlation facts from a row without judging them.
+
+    Covers revision identifiers, request-ID correlation across the HTTP exchange, logs and traces, sampling, and capture
+    warnings. Facts are stated, never interpreted.
+
+    Args:
+        row: One finding.
+
+    Returns:
+        The facts, ready to render into the model's message.
+    """
     rid = row.get("request_id", "").strip()
     facts: Dict[str, object] = {"row_request_id": rid}
 
@@ -500,6 +555,7 @@ def dataset_context(rows: List[Dict[str, str]]) -> Dict[str, str]:
 
 
 def render_facts(facts: Dict[str, object]) -> str:
+    """Render the facts block as indented JSON."""
     return json.dumps(facts, indent=1)
 
 
@@ -507,6 +563,7 @@ _WS = re.compile(r"\s+")
 
 
 def normalise(text: str) -> str:
+    """Lower-case text and collapse whitespace, the form in which quotes are compared with evidence."""
     return _WS.sub(" ", (text or "")).strip().lower()
 
 
@@ -791,10 +848,12 @@ RUBRICS: Dict[str, Dict[str, object]] = {
 
 
 def rubric_for(category: str) -> Optional[Dict[str, object]]:
+    """Return the rubric for a finding category, or None when the category has none."""
     return RUBRICS.get((category or "").strip())
 
 
 def render_rubric(category: str) -> str:
+    """Render a category's rubric as prompt text: decisive boundary, look-alikes and the checklist. Empty if there is none."""
     r = rubric_for(category)
     if not r:
         return ""
@@ -953,6 +1012,13 @@ def _rubric_block(rubric: str) -> str:
 
 
 def user_message(packet: str, facts: str, rubric: str = "") -> str:
+    """Build the message that asks a reviewer to classify one finding.
+
+    Args:
+        packet: The rendered evidence packet.
+        facts: The rendered deterministic facts.
+        rubric: The rendered category rubric, or an empty string.
+    """
     return (
         "Classify the following finding. The deterministic facts block was extracted by code from the same packet "
         "(revision identifiers, request-ID correlation, sampling); it restates the packet and adds nothing new. "
@@ -965,6 +1031,15 @@ def user_message(packet: str, facts: str, rubric: str = "") -> str:
 
 
 def adjudication_message(packet: str, facts: str, first: dict, second: dict, rubric: str = "") -> str:
+    """Build the message that asks the Arbiter to settle two disagreeing reviews.
+
+    Args:
+        packet: The rendered evidence packet.
+        facts: The rendered deterministic facts.
+        first: The first reviewer's assessment.
+        second: The second reviewer's assessment.
+        rubric: The rendered category rubric, or an empty string.
+    """
     def strip(a: dict) -> dict:
         return {k: a.get(k) for k in (
             "classification", "confidence", "checklist", "decisive_boundary", "boundary_observed", "provenance",
@@ -1000,13 +1075,14 @@ class CallStats:
     cost_usd: float = 0.0
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    def add(self, **kw):
+    def add(self, **kw: float) -> None:
+        """Add to the named counters, safely across worker threads."""
         with self.lock:
             for k, v in kw.items():
                 setattr(self, k, getattr(self, k) + v)
 
 
-def validate(obj, schema, path="$") -> List[str]:
+def validate(obj: object, schema: dict, path: str = "$") -> List[str]:
     """Minimal JSON-schema validator for the subset used in the schemas below."""
     errs: List[str] = []
     t = schema.get("type")
@@ -1047,7 +1123,7 @@ def validate(obj, schema, path="$") -> List[str]:
     return errs
 
 
-def _extract_json(text: str):
+def _extract_json(text: str) -> Any:
     text = (text or "").strip()
     try:
         return json.loads(text)
@@ -1076,6 +1152,16 @@ _DENIED_RE = re.compile(r"not_found_error|permission_error|"
 _DENIED_STATUS = {403, 404}
 
 
+class LLMBackend(Protocol):
+    """What the pipeline needs from a model backend: ClaudeCLI in production, FakeLLM in the tests."""
+
+    stats: CallStats
+
+    def complete(self, stage: str, system: str, schema: dict, message: str) -> dict:
+        """Run one model call and return the schema-valid JSON object, or raise LLMError."""
+        ...
+
+
 class ClaudeCLI:
     """`models` is an ordered fallback chain, e.g. ["claude-opus-5-5", "claude-opus-4-8"].
     Per call: try each model in order. A permanent denial moves straight to the
@@ -1084,9 +1170,9 @@ class ClaudeCLI:
     backoff before falling back. The model that actually answered is recorded
     on the output as `_model`."""
 
-    def __init__(self, models, effort: Optional[str] = "high", binary: str = "claude",
+    def __init__(self, models: Union[str, Sequence[str]], effort: Optional[str] = "high", binary: str = "claude",
                  timeout: int = 420, retries: int = 3, cache_dir: Optional[Path] = None,
-                 stats: Optional[CallStats] = None):
+                 stats: Optional[CallStats] = None) -> None:
         self.models = [models] if isinstance(models, str) else list(models)
         if not self.models:
             raise ValueError("at least one model required")
@@ -1102,9 +1188,11 @@ class ClaudeCLI:
 
     @property
     def model(self) -> str:
+        """The model chain as text, primary first."""
         return " -> ".join(self.models)
 
     def check_available(self) -> None:
+        """Raise LLMError if the claude binary is not on PATH."""
         if not shutil.which(self.binary):
             raise LLMError(f"claude CLI not found ({self.binary}); install Claude Code or pass --claude-bin")
 
@@ -1128,6 +1216,7 @@ class ClaudeCLI:
         return self.cache_dir / stage / f"{key}.json"
 
     def cache_key(self, model: str, system: str, schema: dict, message: str) -> str:
+        """Hash of everything that determines a model answer: model, effort, prompts, schema and message."""
         h = hashlib.sha256()
         for part in (model, str(self.effort), system, json.dumps(schema, sort_keys=True), message):
             h.update(part.encode())
@@ -1135,6 +1224,20 @@ class ClaudeCLI:
         return h.hexdigest()[:32]
 
     def complete(self, stage: str, system: str, schema: dict, message: str) -> dict:
+        """Run one model call through the fallback chain, with caching, retries and schema validation.
+
+        Args:
+            stage: Pipeline stage name (classify, verify or adjudicate); selects the cache folder.
+            system: System prompt.
+            schema: JSON schema the answer must satisfy.
+            message: User message.
+
+        Returns:
+            The schema-valid answer, tagged with the model that gave it.
+
+        Raises:
+            LLMError: If every model fails or denies the request.
+        """
         # A cached answer from any model in the chain (preferred order) is reused.
         for model in self.models:
             cp = self._cache_path(stage, self.cache_key(model, system, schema, message))
@@ -1204,7 +1307,7 @@ class ClaudeCLI:
                     time.sleep(min(60, 5 * 2 ** (attempt - 1)))
         raise LLMError(f"failed after {self.retries} attempts: {last}")
 
-    def _call_once(self, model: str, system: str, schema: dict, message: str):
+    def _call_once(self, model: str, system: str, schema: dict, message: str) -> Tuple[dict, float]:
         with tempfile.TemporaryDirectory(prefix="triage-") as sandbox:
             proc = subprocess.run(
                 self._argv(model, system, schema), input=message, capture_output=True, text=True,
@@ -1245,15 +1348,17 @@ class ClaudeCLI:
 class FakeLLM:
     """Test double: `responder(stage, message) -> dict` or raise."""
 
-    def __init__(self, responder: Callable[[str, str], dict]):
+    def __init__(self, responder: Callable[[str, str], dict]) -> None:
         self.responder = responder
         self.stats = CallStats()
         self.model = "fake"
 
     def check_available(self) -> None:
+        """Always available."""
         pass
 
     def complete(self, stage: str, system: str, schema: dict, message: str) -> dict:
+        """Return the responder's answer, rejecting it if it breaks the schema."""
         self.stats.add(calls=1)
         out = self.responder(stage, message)
         errs = validate(out, schema)
@@ -1269,6 +1374,15 @@ class FakeLLM:
 # silently becomes Confirmed (or a confident False Positive): a gate can only
 # move a verdict TOWARDS Needs Review, never away from it.
 def verify_citations(row: Dict[str, str], citations: List[dict]) -> Tuple[List[dict], List[dict]]:
+    """Check that each cited quote appears verbatim in the row.
+
+    Args:
+        row: The finding the quotes were cited against.
+        citations: Quotes with the field each claims to come from.
+
+    Returns:
+        The citations found, with the field they were located in, and the citations not found.
+    """
     verified, rejected = [], []
     for c in citations or []:
         fields = locate_quote(row, c.get("quote", ""))
@@ -1400,7 +1514,16 @@ def apply_gates(row: Dict[str, str], assessment: dict, extra_citations: List[dic
 # gates -> priority.
 
 
-def priority(score: Optional[float], environment: str):
+def priority(score: Optional[float], environment: str) -> Tuple[Optional[float], str]:
+    """Weight a CVSS score by how close the system is to production and assign a fix tier.
+
+    Args:
+        score: The CVSS base score, or None if unscored.
+        environment: The environment name, such as "production".
+
+    Returns:
+        The priority score and its tier (CHASE, LOOK or NOTE), or (None, "") if unscored.
+    """
     if score is None:
         return None, ""
     p = round(score * ENV_WEIGHT.get(environment.strip().lower(), DEFAULT_ENV_WEIGHT), 2)
@@ -1408,11 +1531,16 @@ def priority(score: Optional[float], environment: str):
     return p, tier
 
 
-def _cvss_of(a: dict):
+def _cvss_of(a: dict) -> Tuple[Optional[str], Optional[float], Optional[str]]:
     return score_vector((a.get("report") or {}).get("cvss_vector"))
 
 
 def needs_adjudication(a: dict, b: dict) -> Optional[str]:
+    """Decide whether two reviews of one finding need a third.
+
+    Returns:
+        The reason, or None if the reviews agree on the label and, for Confirmed, on severity within CVSS_DIVERGENCE.
+    """
     if a["classification"] != b["classification"]:
         return f"classification: A={a['classification']} vs B={b['classification']}"
     if a["classification"] == "Confirmed":
@@ -1435,7 +1563,19 @@ def _base_result(row: Dict[str, str]) -> Dict[str, object]:
     return base
 
 
-def assess_row(row: Dict[str, str], llm, context: Optional[Dict[str, str]] = None) -> Dict[str, object]:
+def assess_row(row: Dict[str, str], llm: LLMBackend, context: Optional[Dict[str, str]] = None) -> Dict[str, object]:
+    """Run the full pipeline for one finding: classify, verify blind, adjudicate on disagreement, then gate.
+
+    Any model failure routes the finding to Needs Review with confidence 0 instead of raising.
+
+    Args:
+        row: The finding.
+        llm: The model backend.
+        context: Dataset-wide context computed across all rows, if any.
+
+    Returns:
+        The final result, including both reviews, the gate outcome and, for Confirmed, the CVSS score and priority.
+    """
     packet = render_packet(row)
     facts_obj = extract_facts(row)
     facts = render_facts({**facts_obj, "dataset_context": context} if context else facts_obj)
@@ -1457,7 +1597,9 @@ def assess_row(row: Dict[str, str], llm, context: Optional[Dict[str, str]] = Non
         # Agreement: the assessment with more verifiable evidence is primary; both
         # assessors' citations are pooled for the gate. Confidence is the LOWER of
         # the two, and the boundary counts as observed only if both say so.
-        n_verified = lambda x: len(verify_citations(row, x.get("evidence", []))[0])
+        def n_verified(x: dict) -> int:
+            return len(verify_citations(row, x.get("evidence", []))[0])
+
         primary, other = (a, b) if n_verified(a) >= n_verified(b) else (b, a)
         if primary["classification"] == "Confirmed" and _cvss_of(primary)[0] is None:
             primary, other = other, primary
@@ -1543,9 +1685,21 @@ def _failed(base: dict, error: str, **assessments) -> Dict[str, object]:
     return out
 
 
-def run(rows: List[Dict[str, str]], llm, workers: int = 4,
+def run(rows: List[Dict[str, str]], llm: LLMBackend, workers: int = 4,
         progress: Optional[Callable[[int, int, dict], None]] = None,
         context: Optional[Dict[str, str]] = None) -> List[Dict[str, object]]:
+    """Assess every row in parallel.
+
+    Args:
+        rows: The findings to assess.
+        llm: The model backend.
+        workers: Number of findings assessed at once.
+        progress: Called with (done, total, result) as each finding finishes.
+        context: Dataset-wide context passed to every assessment.
+
+    Returns:
+        One result per row, in input order.
+    """
     results: Dict[str, dict] = {}
     pool = cf.ThreadPoolExecutor(max_workers=max(1, workers))
     try:
@@ -1569,6 +1723,7 @@ def run(rows: List[Dict[str, str]], llm, workers: int = 4,
 
 
 def equivalence_key(row: Dict[str, str], facts: Dict[str, object]) -> tuple:
+    """Key under which two rows carry the same evidence: same scenario and same evidence-profile facts."""
     return scenario_key(row) + tuple(str(facts.get(k)) for k in EVIDENCE_PROFILE_FACTS)
 
 
@@ -1658,6 +1813,7 @@ AI_TELLS = re.compile(
 
 
 def plain_text(text: str) -> str:
+    """Rewrite model-written text into plain client-facing language: no dashes, filler phrases, internal field names or jargon."""
     if not text:
         return text
     t = str(text)
@@ -1697,6 +1853,7 @@ CLIENT_TEXT_FIELDS = ("reasoning", "missing_evidence", "decisive_boundary", "pro
 
 
 def polish_result(r: Dict[str, object]) -> Dict[str, object]:
+    """Clean every client-facing text field of a result in place and return it."""
     for k in CLIENT_TEXT_FIELDS:
         if isinstance(r.get(k), str):
             r[k] = plain_text(r[k])
@@ -1753,6 +1910,7 @@ CHAIN_RULES = [
 
 
 def chain_step(result: Dict[str, object]) -> Optional[str]:
+    """Name the attack-progression step a result represents, or None if it fits no known step."""
     cat, title = result.get("category", ""), (result.get("finding_title") or "").lower()
     for step, (c, keyword) in _STEP.items():
         if cat == c and keyword in title:
@@ -1897,7 +2055,8 @@ FIELD_LABELS = {
 }
 
 
-def e(x) -> str:
+def e(x: object) -> str:
+    """Escape a value for HTML. None becomes an empty string."""
     return html.escape("" if x is None else str(x), quote=True)
 
 
@@ -1911,7 +2070,7 @@ _CODE_TOKEN = re.compile(
     r"|\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b")
 
 
-def prose(x) -> str:
+def prose(x: object) -> str:
     """Escape model-written prose and set code-like tokens in <code>."""
     out, last = [], 0
     text = "" if x is None else str(x)
@@ -1923,7 +2082,7 @@ def prose(x) -> str:
     return "".join(out)
 
 
-def _sev_badge(sev) -> str:
+def _sev_badge(sev: Optional[str]) -> str:
     return f'<span class="sev sev-{e((sev or "none").lower())}">{e({"Medium": "Moderate"}.get(sev, sev or "Unscored"))}</span>'
 
 
@@ -1948,15 +2107,15 @@ def _cls_badge(c: str) -> str:
     return f'<span class="cls cls-{slug}">{e(c)}</span>'
 
 
-def _priority_key(r):
+def _priority_key(r: dict) -> tuple:
     return (-(r.get("priority_score") or 0), SEV_ORDER.get(r.get("cvss_severity"), 5), r["finding_id"])
 
 
-def _title_key(r):
+def _title_key(r: dict) -> tuple:
     return (r["finding_title"], r["finding_id"])
 
 
-def _group_by_title(rows: List[dict], key) -> Dict[str, List[dict]]:
+def _group_by_title(rows: List[dict], key: Callable[[dict], Any]) -> Dict[str, List[dict]]:
     """Group rows by finding title; groups and members follow `key` order."""
     groups: Dict[str, List[dict]] = {}
     for r in sorted(rows, key=key):
@@ -1996,6 +2155,7 @@ CVSS_METRICS = {
 
 
 def issue_key(r: dict) -> str:
+    """Group key for the same flaw wherever it occurs: its attack step, else its category."""
     return chain_step(r) or "other:" + str(r.get("category") or "uncategorised")
 
 
@@ -2012,7 +2172,9 @@ def _date_window(days: List[str], default: str = "the observation period") -> st
             continue
     if not good:
         return default
-    fmt = lambda d: d.strftime("%B %d, %Y").replace(" 0", " ")
+    def fmt(d: dt.date) -> str:
+        return d.strftime("%B %d, %Y").replace(" 0", " ")
+
     return f"{fmt(min(good))} to {fmt(max(good))}"
 
 
@@ -2025,19 +2187,20 @@ def display_title(r: dict) -> str:
 
 
 def issue_label(key: str, lead: dict) -> str:
+    """Short plain name for an issue type, used in headings and charts."""
     if key in ISSUE_LABEL:
         return ISSUE_LABEL[key]
     return (lead.get("client_title") or lead.get("finding_title") or "Other").split(" (")[0]
 
 
-def _group_by_issue(rows: List[dict], key=_priority_key) -> Dict[str, List[dict]]:
+def _group_by_issue(rows: List[dict], key: Callable[[dict], Any] = _priority_key) -> Dict[str, List[dict]]:
     groups: Dict[str, List[dict]] = {}
     for r in sorted(rows, key=key):
         groups.setdefault(issue_key(r), []).append(r)
     return groups
 
 
-def _sentences(text) -> List[str]:
+def _sentences(text: object) -> List[str]:
     # Not after "...", "= ?" or ".." (SQL placeholders and ellipses inside code samples).
     return [s.strip() for s in re.split(r"(?<=[.!?])(?<!\.\.\.)(?<!= \?)\s+(?=[A-Z0-9])", str(text or "").strip()) if s.strip()]
 
@@ -2047,7 +2210,7 @@ _HARDEN = re.compile(r"^(as (further |additional )?(defence|defense|protection)|
 _VERIFY = re.compile(r"^(to verify|verify|to confirm|confirm that|check that)", re.I)
 
 
-def split_fix(text) -> Tuple[List[str], List[str], List[str]]:
+def split_fix(text: object) -> Tuple[List[str], List[str], List[str]]:
     """Split the recommended-fix paragraph into what to change, extra hardening and how to verify."""
     steps, harden, verify = [], [], []
     state = steps
@@ -2064,12 +2227,12 @@ def _list(items: List[str], cls: str = "") -> str:
     return f"<ul class='{cls}'>" + "".join(f"<li>{prose(i)}</li>" for i in items) + "</ul>" if items else ""
 
 
-def _trim(s, n: int = 240) -> str:
+def _trim(s: object, n: int = 240) -> str:
     s = re.sub(r"\s+", " ", str(s or "")).strip()
     return s if len(s) <= n else s[: n - 1].rstrip() + "..."
 
 
-def _sev_of(score) -> str:
+def _sev_of(score: Optional[float]) -> str:
     if score is None:
         return "None"
     return "Critical" if score >= 9 else "High" if score >= 7 else "Medium" if score >= 4 else "Low" if score > 0 else "None"
@@ -2133,7 +2296,7 @@ def _heatmap(confirmed: List[dict]) -> str:
     return f"<table class='heat'><thead><tr><th></th>{head}</tr></thead><tbody>{''.join(body)}</tbody></table>"
 
 
-def _score_meter(score) -> str:
+def _score_meter(score: Optional[float]) -> str:
     if score is None:
         return ""
     pos = max(0.0, min(float(score), 10.0)) * 10
@@ -2142,7 +2305,7 @@ def _score_meter(score) -> str:
             f"<div class='mlab'><span>0</span><span>Low</span><span>Medium</span><span>High</span><span>Critical</span><span>10</span></div>")
 
 
-def _cvss_chips(vector) -> str:
+def _cvss_chips(vector: object) -> str:
     parts = dict(p.split(":", 1) for p in str(vector or "").split("/")[1:] if ":" in p)
     chips = []
     for k, (name, vals) in CVSS_METRICS.items():
@@ -2160,7 +2323,7 @@ def _env_chips(rows: List[dict]) -> str:
     return "".join(f"<span class='env env-{e(x)}'>{e(x)} {cnt[x]}</span>" for x in order)
 
 
-def _tier_badge(tier) -> str:
+def _tier_badge(tier: Optional[str]) -> str:
     return f"<span class='tier tier-{e((tier or '').lower())}'>{e(TIER_LABEL.get(tier, tier))}</span>" if tier else ""
 
 
@@ -2180,7 +2343,7 @@ def _evidence_points(ev: List[dict], limit: int = 4) -> str:
     return f"<ul class='proof'>{''.join(items)}</ul>{more}"
 
 
-def _impact_block(text) -> str:
+def _impact_block(text: object) -> str:
     sents = _sentences(text)
     if not sents:
         return ""
@@ -2188,7 +2351,7 @@ def _impact_block(text) -> str:
     return f"<p class='lead'>{prose(lead)}</p>" + (f"<p>{prose(rest)}</p>" if rest else "")
 
 
-def _fix_block(text) -> str:
+def _fix_block(text: object) -> str:
     steps, harden, verify = split_fix(text)
     out = ""
     if steps:
@@ -2331,12 +2494,12 @@ SEV_DEFS = [
 _VECTOR_WORDS = {"N": "Remote (network)", "A": "Adjacent (internal network)", "L": "Local", "P": "Physical"}
 
 
-def _vector_word(vec) -> str:
+def _vector_word(vec: object) -> str:
     m = re.search(r"AV:([NALP])", str(vec or ""))
     return _VECTOR_WORDS.get(m.group(1), "Not scored") if m else "Not scored"
 
 
-def _sev_cell(sev) -> str:
+def _sev_cell(sev: Optional[str]) -> str:
     return f"<td class='sevcell sc-{e((sev or 'none').lower())}'>{e(SEV_DISPLAY.get(sev, sev or 'Unscored'))}</td>"
 
 
@@ -2591,6 +2754,21 @@ def _cover(client_html: str, title: str, meta: List[Tuple[str, str]], kicker: st
 
 
 def build_report(results: List[dict], source_name: str, model: str, chains: List[dict] = (), client: str = "Client") -> str:
+    """Render the technical report for internal analysts and engineers.
+
+    It carries every verdict, including false positives and findings that need more evidence, with the evidence,
+    CVSS reasoning, method and a searchable appendix.
+
+    Args:
+        results: Final per-finding results.
+        source_name: Name of the input file.
+        model: Description of the models that answered.
+        chains: Attack chains correlated from the confirmed findings.
+        client: Client name shown in headings.
+
+    Returns:
+        A self-contained HTML page.
+    """
     cl = e(client)
     counts = collections.Counter(r["classification"] for r in results)
     confirmed = [r for r in results if r["classification"] == "Confirmed"]
@@ -2794,7 +2972,7 @@ window.addEventListener('hashchange',function(){{openFor(location.hash)}});openF
 # questions, method). This one is for the customer: only findings that were
 # confirmed, each with its CVSS 3.1 score, plain-language business impact and
 # recommended fix, ordered by what to do first.
-def _client_fix(text) -> str:
+def _client_fix(text: object) -> str:
     steps, harden, verify = split_fix(text)
     out = ""
     if steps or harden:
@@ -2928,6 +3106,22 @@ def _client_issue(n: int, rows: List[dict], source: Optional[Dict[str, Dict[str,
 
 def build_client_report(results: List[dict], source_name: str, chains: List[dict] = (), client: str = "Client",
                         source_rows: Optional[Dict[str, Dict[str, str]]] = None) -> str:
+    """Render the executive report for leadership and risk owners.
+
+    It carries confirmed findings only, in business terms: a risk posture, what leadership needs to know, decisions
+    requested and, for each issue, score, impact, fix and the evidence behind every finding ID.
+
+    Args:
+        results: Final per-finding results.
+        source_name: Name of the input file.
+        chains: Attack chains correlated from the confirmed findings.
+        client: Client name shown in headings.
+        source_rows: The input rows by finding_id, so evidence can be shown in full. Without them only the quoted
+            lines are shown.
+
+    Returns:
+        A self-contained HTML page.
+    """
     cl = e(client)
     confirmed = sorted((r for r in results if r["classification"] == "Confirmed"), key=_priority_key)
     sev = collections.Counter(r.get("cvss_severity") for r in confirmed)
@@ -2939,7 +3133,7 @@ def build_client_report(results: List[dict], source_name: str, chains: List[dict
     for r in confirmed:
         by_issue.setdefault(client_issue_key(r), []).append(r)
 
-    def order(rows):  # worst severity first, then production exposure, then reach
+    def order(rows: List[dict]) -> tuple:  # worst severity first, then production exposure, then reach
         lead = rows[0]
         return (SEV_ORDER.get(lead.get("cvss_severity"), 5), -(lead.get("cvss_score") or 0),
                 -sum(1 for r in rows if r["environment"].strip().lower() == "production"), -len(rows), lead["finding_id"])
@@ -2947,7 +3141,10 @@ def build_client_report(results: List[dict], source_name: str, chains: List[dict
     number = {id(rows): i for i, rows in enumerate(issues, 1)}
     seen = sorted(r.get("first_observed_utc", "")[:10] for r in results if r.get("first_observed_utc"))
     window = _date_window(seen, "the review period")
-    best_tier = lambda rows: min((r.get("priority_tier") or "NOTE" for r in rows), key={"CHASE": 0, "LOOK": 1, "NOTE": 2}.get)
+    def best_tier(rows: List[dict]) -> str:
+        """The most urgent fix tier among an issue's findings."""
+        return min((r.get("priority_tier") or "NOTE" for r in rows), key={"CHASE": 0, "LOOK": 1, "NOTE": 2}.get)
+
     index_rows = "".join(
         f"<tr><td>{number[id(rows)]}</td><td><a href='#issue-{number[id(rows)]}'>{e(display_title(rows[0]))}</a></td>"
         f"{_sev_cell(rows[0].get('cvss_severity'))}<td class='n'>{e(rows[0].get('cvss_score'))}</td><td class='n'>{len(rows)}</td>"
@@ -2974,7 +3171,9 @@ def build_client_report(results: List[dict], source_name: str, chains: List[dict
     headline = (f"{lead_in} present in production: {len(prod)} findings on {prod_systems} production "
                 f"system{'s' if prod_systems != 1 else ''}, {prod_hi} of them rated High or Critical." if prod
                 else "None of the confirmed findings affects production.")
-    n_issues = lambda sv: sum(1 for rows in issues if rows[0].get("cvss_severity") == sv)
+    def n_issues(severity: str) -> int:
+        return sum(1 for rows in issues if rows[0].get("cvss_severity") == severity)
+
     sev_table = "".join(
         f"<tr><td class='sevcell sc-{sv.lower()}'>{lab}</td><td class='n'>{n_issues(sv)}</td><td class='n'>{sev.get(sv, 0)}</td></tr>"
         for sv, lab in (("Critical", "Critical"), ("High", "High"), ("Medium", "Moderate"), ("Low", "Low")))
@@ -3036,6 +3235,11 @@ HERE = Path(__file__).resolve().parent
 
 
 def choose_csv() -> Path:
+    """Ask the user to pick a CSV from the current and data directories, or to type a path.
+
+    Raises:
+        SystemExit: If input ends before a file is chosen.
+    """
     candidates = sorted({p.resolve() for d in (Path.cwd(), HERE / "data") if d.is_dir() for p in d.glob("*.csv")})
     if candidates:
         print("CSV files found:")
@@ -3094,7 +3298,8 @@ def rebuild_reports(out: Path, source_name: str, source_csv: Optional[Path] = No
     return 0
 
 
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Define the command-line options."""
     ap = argparse.ArgumentParser(description="Classify scanner findings as Confirmed / False Positive / Needs Review.")
     ap.add_argument("--csv", type=Path, help="input findings CSV (prompted if omitted)")
     ap.add_argument("--out", type=Path, default=HERE / "out", help="output directory (default: ./out)")
@@ -3113,7 +3318,19 @@ def main(argv=None) -> int:
     ap.add_argument("--rebuild-reports", action="store_true",
                     help="rebuild both HTML reports from the saved out/assessments.jsonl; no model calls")
     ap.add_argument("--self-test", action="store_true", help="run the built-in test suite and exit")
-    args = ap.parse_args(argv)
+    return ap
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Command-line entry point.
+
+    Args:
+        argv: Arguments to parse; defaults to sys.argv.
+
+    Returns:
+        Exit code: 0 success, 2 input error, 3 some findings could not be assessed, 130 interrupted.
+    """
+    args = build_parser().parse_args(argv)
     if args.self_test:
         result = unittest.main(module=__name__, argv=[sys.argv[0]], exit=False, verbosity=2).result
         return 0 if result.wasSuccessful() else 1
@@ -3156,7 +3373,7 @@ def main(argv=None) -> int:
     t0 = time.time()
     tally = collections.Counter()
 
-    def progress(done, total, res):
+    def progress(done: int, total: int, res: dict) -> None:
         tally[res["classification"]] += 1
         print(f"[{done:>4}/{total}] {res['finding_id']}  {res['classification']:<14} conf={res['confidence']:<4} "
               f"{res['assessor_agreement'][:60]}  | C={tally['Confirmed']} FP={tally['False Positive']} "
@@ -3227,7 +3444,7 @@ def main(argv=None) -> int:
 # ============================================================================
 # Self-tests (python3 triage.py --self-test)
 # ============================================================================
-def _test_row(**kw):
+def _test_row(**kw: Any) -> Dict[str, str]:
     base = {
         "finding_id": "T-1", "asset": "api.example", "environment": "production", "finding_title": "IDOR",
         "category": "Authorization", "asset_owner": "Fleet API", "request_id": "req_abc",
@@ -3248,7 +3465,7 @@ GOOD_QUOTES = [("observation", "Tenant B session retrieved tenant A vehicle reco
 CHECK_QUOTE = GOOD_QUOTES[0]
 
 
-def _test_checklist(cls, category="Authorization", **override):
+def _test_checklist(cls: str, category: str = "Authorization", **override: Any) -> List[dict]:
     """A checklist consistent with `cls`: every check yes (Confirmed), no (False Positive) or unknown (Needs Review).
     `override` maps a check id to an answer, or to a (answer, field, quote) tuple."""
     out = []
@@ -3265,8 +3482,9 @@ def _test_checklist(cls, category="Authorization", **override):
     return out
 
 
-def _test_assessment(cls, quotes, conf=0.9, observed=True, vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
-                     checklist=None):
+def _test_assessment(cls: str, quotes: List[Tuple[str, str]], conf: float = 0.9, observed: bool = True,
+                     vector: str = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
+                     checklist: Optional[List[dict]] = None) -> dict:
     return {
         "checklist": _test_checklist(cls) if checklist is None else checklist,
         "decisive_boundary": "cross-tenant read", "boundary_observed": observed, "provenance": "runtime",
@@ -3278,7 +3496,7 @@ def _test_assessment(cls, quotes, conf=0.9, observed=True, vector="CVSS:3.1/AV:N
     }
 
 
-def _synthetic_findings():
+def _synthetic_findings() -> List[Dict[str, str]]:
     """Four small findings: two scenarios, each reported twice by different scanners, with a fixed
     capture header set, a capture/log date offset, an unrelated request ID in the logs and a source
     revision that differs from the manifest."""
