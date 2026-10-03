@@ -4,7 +4,7 @@
 Usage:
   python3 triage.py                       # prompts you to pick a .csv
   python3 triage.py --csv findings.csv
-  python3 triage.py --csv f.csv --model claude-sonnet-5-5 --out out-sonnet
+  python3 triage.py --csv f.csv --model claude-opus-5-5 --out out-opus
 
 Single-file triage pipeline (stdlib only, Python >= 3.9).
 Requires the Claude Code CLI (`claude`) on PATH and logged in.
@@ -2836,8 +2836,8 @@ Where the same flaw appears on several systems it is reported once, with every a
 # ============================================================================
 # Command line
 # ============================================================================
-DEFAULT_MODEL = "claude-opus-5-5"
-DEFAULT_FALLBACK = "claude-opus-4-8"
+DEFAULT_MODEL = "claude-sonnet-5-5"
+DEFAULT_FALLBACK = "claude-opus-5-5"
 HERE = Path(__file__).resolve().parent
 
 

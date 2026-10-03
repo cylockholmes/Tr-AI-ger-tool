@@ -192,8 +192,8 @@ Both reports print cleanly.
 | `--csv PATH` | Input file (prompted if omitted) |
 | `--out DIR` | Output directory (default `./out`) |
 | `--client-name NAME` | Name shown in report headings (default `Client`) |
-| `--model` | Primary model (default `claude-opus-5-5`) |
-| `--fallback-model` | Comma-separated fallbacks (default `claude-opus-4-8`; `''` for none) |
+| `--model` | Primary model (default `claude-sonnet-5-5`) |
+| `--fallback-model` | Comma-separated fallbacks (default `claude-opus-5-5`; `''` for none) |
 | `--effort` | Reasoning effort passed to the CLI (default `high`) |
 | `--workers N` | Findings assessed in parallel (default 4) |
 | `--timeout S` | Per-call timeout in seconds (default 420) |
