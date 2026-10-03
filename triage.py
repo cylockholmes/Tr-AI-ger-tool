@@ -570,7 +570,6 @@ ASSESSMENT_SCHEMA = {
             "description": "One entry per check in the category rubric, answered before the classification. "
                            "Empty only when the packet carries no rubric.",
             "items": _CHECK,
-            "maxItems": 8,
         },
         "decisive_boundary": {
             "type": "string",
@@ -1283,8 +1282,8 @@ def verify_citations(row: Dict[str, str], citations: List[dict]) -> Tuple[List[d
 
 
 def verify_checklist(row: Dict[str, str], checklist: List[dict]) -> List[dict]:
-    """One entry per rubric check, in rubric order. An answer of yes or no only counts as `backed` when its quote
-    is found verbatim in the row; a missing or repeated check id is treated as unknown."""
+    """One entry per rubric check, in rubric order. A yes or no only counts as `backed` when its quote is found
+    verbatim in the row; a missing or repeated check id is treated as unknown."""
     rubric = rubric_for(row.get("category", ""))
     if not rubric:
         return []
@@ -1295,25 +1294,21 @@ def verify_checklist(row: Dict[str, str], checklist: List[dict]) -> List[dict]:
     for cid, text in rubric["checks"]:
         c = given.get(cid) or {}
         answer = c.get("answer") if c.get("answer") in ("yes", "no") else "unknown"
-        fields = locate_quote(row, c.get("quote", "")) if answer != "unknown" else []
-        out.append({"id": cid, "check": text, "answer": answer, "quote": c.get("quote", "") if fields else "",
-                    "field": (c.get("field") if c.get("field") in fields else fields[0]) if fields else "",
-                    "backed": bool(fields)})
+        hit = next(iter(verify_citations(row, [c])[0]), {}) if answer != "unknown" else {}
+        out.append({"id": cid, "check": text, "answer": answer, "backed": bool(hit),
+                    "field": hit.get("field", ""), "quote": hit.get("quote", "")})
     return out
 
 
 def merge_checklists(row: Dict[str, str], first: List[dict], second: List[dict]) -> List[dict]:
     """Two agreeing assessors: a check keeps its answer only when both gave it; otherwise it is unknown."""
-    a = {c["id"]: c for c in verify_checklist(row, first)}
-    b = {c["id"]: c for c in verify_checklist(row, second)}
     out = []
-    for cid, ca in a.items():
-        cb = b[cid]
-        if ca["answer"] == cb["answer"] and ca["answer"] != "unknown":
+    for ca, cb in zip(verify_checklist(row, first), verify_checklist(row, second)):
+        if ca["answer"] == cb["answer"] != "unknown":
             pick = ca if ca["backed"] else cb
-            out.append({"id": cid, "answer": ca["answer"], "field": pick["field"], "quote": pick["quote"]})
+            out.append({"id": ca["id"], "answer": ca["answer"], "field": pick["field"], "quote": pick["quote"]})
         else:
-            out.append({"id": cid, "answer": "unknown", "field": "", "quote": ""})
+            out.append({"id": ca["id"], "answer": "unknown", "field": "", "quote": ""})
     return out
 
 
@@ -2437,6 +2432,164 @@ def _attack_summary(chains: List[dict], by_id: Dict[str, dict]) -> str:
     return "".join(out) or "<p class='muted'>No combination of confirmed findings in a single environment forms a known attack progression.</p>"
 
 
+# ---------------------------------------------------------------------------
+# Report design
+# ---------------------------------------------------------------------------
+# Both reports share one visual system: ink-black and warm paper, a vermilion
+# signal colour and an acid-lime highlight, an editorial serif for headings, a
+# grotesque for body copy and a monospace for labels and evidence (the code
+# panels use the same night-mode palette as a code editor). Section headings sit
+# in a left rail beside their content on wide screens; print and phones fall
+# back to a single column. Fonts load from Google Fonts and degrade to the
+# local fallbacks below when offline or printed without a network.
+FONT_LINKS = (
+    '<link rel="preconnect" href="https://fonts.googleapis.com">'
+    '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+    '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,700;9..144,900'
+    '&family=Hanken+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap">')
+
+REPORT_BASE_CSS = """
+:root{--paper:#f4efe4;--sheet:#fffdf8;--ink:#14110f;--muted:#5d564c;--line:#d8d0c0;--soft:#ece5d6;--night:#0e1218;--night2:#1a212b;
+--accent:#14110f;--red:#ff4a1c;--lime:#c9ff3b;--crit:#b3123a;--high:#d9480f;--med:#8f6200;--low:#2b7a4b;--conf:#b3123a;--fp:#2b7a4b;--nr:#8f6200;
+--display:"Fraunces","Iowan Old Style","Palatino Linotype",Georgia,serif;--body:"Hanken Grotesk","Avenir Next","Gill Sans",Optima,sans-serif;
+--mono:"JetBrains Mono","SF Mono",Menlo,Consolas,monospace}
+*{box-sizing:border-box;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+body{margin:0;color:var(--ink);font:15px/1.65 var(--body);background-color:var(--paper);
+ background-image:linear-gradient(135deg,rgba(255,74,28,.10) 0,rgba(255,74,28,0) 38%),
+  repeating-linear-gradient(90deg,rgba(20,17,15,.045) 0 1px,transparent 1px 44px),
+  repeating-linear-gradient(0deg,rgba(20,17,15,.045) 0 1px,transparent 1px 44px)}
+a{color:var(--ink);text-decoration-color:var(--red);text-decoration-thickness:2px;text-underline-offset:3px}
+a:hover{background:var(--lime)}
+.doc{max-width:1080px;margin:32px auto;background:var(--sheet);border:2px solid var(--ink);box-shadow:12px 12px 0 var(--ink)}
+.cover{position:relative;overflow:hidden;color:#f6f1e6;min-height:560px;padding:72px 64px 48px;display:grid;grid-template-rows:auto 1fr auto;gap:28px;
+ background:radial-gradient(circle at 88% 12%,rgba(255,74,28,.85) 0,rgba(255,74,28,0) 34%),
+  radial-gradient(circle at 8% 100%,rgba(201,255,59,.22) 0,rgba(201,255,59,0) 40%),
+  repeating-linear-gradient(135deg,rgba(255,255,255,.05) 0 2px,transparent 2px 22px),
+  repeating-linear-gradient(90deg,rgba(255,255,255,.06) 0 1px,transparent 1px 64px),var(--night)}
+.cover::after{content:"";position:absolute;right:-90px;bottom:-90px;width:340px;height:340px;border:2px solid var(--lime);transform:rotate(18deg);opacity:.55}
+.cover .kicker{font:600 12px var(--mono);letter-spacing:.18em;text-transform:uppercase;color:var(--lime)}
+.cover .co{font:900 clamp(44px,8vw,96px)/.95 var(--display);letter-spacing:-.02em;align-self:end}
+.cover .tt{font:400 clamp(20px,3vw,30px)/1.25 var(--display);font-style:italic;max-width:620px;margin-top:14px;color:#ece4d2}
+.cover .rule{width:120px;height:8px;background:var(--lime);margin:26px 0 0}
+.cover .meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,max-content));gap:6px 40px;font:12.5px var(--mono);color:#cfc8b8;position:relative;z-index:1}
+.cover .meta span{display:block;color:var(--lime);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase}
+.page{padding:36px 64px 12px;display:grid;grid-template-columns:190px minmax(0,1fr);column-gap:36px;counter-reset:sec}
+.page>*{grid-column:2;min-width:0}
+.page>h2{grid-column:1;align-self:start;position:sticky;top:14px;margin:30px 0 14px}
+h2{font:900 26px/1.05 var(--display);letter-spacing:-.01em;scroll-margin-top:14px;counter-increment:sec;border-top:6px solid var(--ink);padding-top:10px}
+h2::before{content:counter(sec,decimal-leading-zero);display:block;font:600 12px var(--mono);letter-spacing:.14em;color:var(--red);margin-bottom:6px}
+h3{font:700 22px/1.2 var(--display);margin:26px 0 8px;scroll-margin-top:14px}
+h4{font:600 11.5px var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin:20px 0 6px}
+p{margin:5px 0 11px}
+code{font:12.5px/1.5 var(--mono);background:rgba(20,17,15,.08);padding:1px 5px;border-radius:2px;word-break:break-word}
+.muted{color:var(--muted)} .lead{font-weight:700}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font:600 11px var(--mono);letter-spacing:.1em;text-transform:uppercase}
+table.grid th{background:var(--ink);color:var(--paper);border-bottom:0}
+.sevcell{font:700 12px var(--mono);letter-spacing:.06em;text-transform:uppercase;color:#fff;text-align:center;white-space:nowrap}
+.sc-critical{background:var(--crit)} .sc-high{background:var(--high)} .sc-medium{background:var(--med)} .sc-low{background:var(--low)} .sc-none{background:#6b655b}
+.sevtag,.sev,.cls,.tier{display:inline-block;font:700 11px var(--mono);letter-spacing:.06em;text-transform:uppercase;padding:2px 8px;border-radius:2px;color:#fff;background:#6b655b;white-space:nowrap}
+.sevtag{vertical-align:middle;margin-left:6px}
+.sev-critical{background:var(--crit)} .sev-high{background:var(--high)} .sev-medium{background:var(--med)} .sev-low{background:var(--low)}
+.cls-conf{background:var(--conf)} .cls-fp{background:var(--fp)} .cls-nr{background:var(--nr)}
+.callout{margin:16px 0;padding:16px 20px;background:var(--ink);color:var(--paper);border-left:10px solid var(--lime)}
+.callout b,.callout .big{font:700 20px/1.25 var(--display);display:block;margin-bottom:4px}
+.twocol{display:grid;grid-template-columns:1.25fr .75fr;gap:30px}
+.brow{display:grid;grid-template-columns:minmax(120px,42%) 1fr 28px;gap:10px;align-items:center;margin:6px 0;font-size:13px}
+.bt{height:12px;background:var(--soft);display:block} .bf{display:block;height:100%} .bv{text-align:right;font-family:var(--mono)} .bl a{text-decoration:none}
+.donut{display:flex;align-items:center;gap:16px;flex-wrap:wrap} .donut svg{width:140px;height:140px}
+.dn{font:900 28px var(--display);fill:var(--ink)} .ds{font:11px var(--mono);fill:var(--muted)}
+.legend{list-style:none;padding:0;margin:0} .legend li{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:13px} .legend i{width:12px;height:12px;display:inline-block}
+table.heat{border-collapse:separate;border-spacing:3px;width:auto} table.heat th{border:0;background:none;color:var(--muted);text-align:center;padding:3px}
+table.heat th[scope=row]{text-align:left;color:var(--ink)}
+td.hm{border:0;text-align:center;font:700 13px var(--mono);min-width:52px;height:30px;background:color-mix(in srgb,var(--c) calc(var(--a)*100%),transparent)}
+td.tot{border:0;text-align:center;font-weight:700}
+.count{font:600 11px var(--mono);letter-spacing:.04em;background:var(--lime);color:var(--ink);padding:2px 9px;margin-left:8px;vertical-align:middle;white-space:nowrap}
+.foot{padding:22px 64px 40px;color:var(--muted);font:12px var(--mono);letter-spacing:.04em;border-top:2px solid var(--ink)}
+@media (max-width:860px){.page{display:block;padding:20px 18px}.page>h2{position:static}.cover{padding:48px 22px 32px;min-height:440px}
+ .twocol{grid-template-columns:1fr}.doc{margin:0;box-shadow:none;border-width:0}.foot{padding:18px}}
+@media print{body{background:#fff}.doc{box-shadow:none;border:0;margin:0;max-width:none}.cover{min-height:92vh;break-after:page}
+ .page{display:block;padding:0 6px}.page>h2{position:static}h2{break-before:page;break-after:avoid}h3,h4{break-after:avoid}
+ table,figure,.callout{break-inside:avoid}tr{break-inside:avoid}@page{margin:16mm 14mm}}
+"""
+
+ANALYST_CSS = """
+.toc{columns:2;column-gap:36px;list-style:none;padding:0;counter-reset:toc}
+.toc li{padding:5px 0;border-bottom:1px solid var(--line);break-inside:avoid} .toc a{text-decoration:none;font-weight:500}
+.fcode{font:600 12.5px var(--mono);background:var(--lime);padding:2px 7px;margin-right:4px}
+table.kv{margin:8px 0 14px} table.kv th{width:130px;white-space:nowrap;background:var(--soft);color:var(--ink)}
+td.c{text-align:center;font-weight:700;width:46px}
+.tier{background:transparent;color:var(--ink);border:1px solid var(--ink);font-weight:600} .tier-chase{border-color:var(--crit);color:var(--crit)} .tier-look{border-color:var(--med);color:var(--med)}
+ul.items,ul.plain{margin:0;padding-left:18px} ul.plain{list-style:none;padding:0} ul.items li{margin:5px 0}
+figure{margin:14px 0;border:1px solid var(--night);break-inside:avoid;background:var(--night)}
+figure pre{margin:0;padding:12px 14px;color:#e6edf3;white-space:pre-wrap;word-break:break-word;font:12px/1.55 var(--mono);border-left:4px solid var(--lime)}
+figcaption{padding:7px 14px;background:var(--night2);font:11.5px var(--mono);color:#a9b3c1} .src{text-transform:uppercase;font-size:10.5px;letter-spacing:.1em;color:var(--lime)}
+ul.chips{list-style:none;padding:0;margin:8px 0 0;display:flex;flex-wrap:wrap;gap:6px}
+.chips li{border:1px solid var(--ink);padding:3px 8px;font-size:11.5px;line-height:1.3} .chips li span{display:block;color:var(--muted)} .chips li.hot{background:rgba(255,74,28,.12);border-color:var(--red)}
+.note{font-size:13px;background:var(--soft);padding:6px 10px} .banner{border:2px solid var(--crit);background:rgba(179,18,58,.08);padding:10px 14px;margin:12px 0}
+.bars{margin-top:4px}
+details{margin:6px 0;font-size:13px} summary{cursor:pointer;font-weight:700}
+ul.proof{list-style:none;padding:0} ul.proof li{border-left:4px solid var(--ink);padding:3px 0 3px 12px;margin:8px 0} ul.proof li b{display:block}
+code.quote{display:block;white-space:pre-wrap}
+details.nrg{border:1px solid var(--ink);padding:8px 14px;margin:8px 0} details.nrg summary small{display:block;font-weight:400;color:var(--muted)}
+.tablewrap{overflow-x:auto} td.reason{min-width:300px}
+.filters{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+.filters input{flex:1;min-width:200px;padding:8px;border:2px solid var(--ink);background:#fff;font:13px var(--mono)}
+.filters button{padding:7px 13px;border:2px solid var(--ink);background:#fff;cursor:pointer;font:600 12px var(--mono)}
+.filters button.on{background:var(--ink);color:var(--lime)}
+@media (max-width:860px){.toc{columns:1}}
+@media print{.noprint,.filters{display:none}.finding{break-before:page}}
+"""
+
+CLIENT_CSS = """
+h4{margin:4px 0 6px}
+.posture{display:grid;grid-template-columns:auto 1fr;gap:2px 26px;align-items:center;border:2px solid var(--ink);border-left:16px solid var(--c);padding:16px 24px;margin:6px 0 18px;background:var(--sheet)}
+.posture .plabel{grid-column:1/-1;font:600 11px var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.posture b{font:900 clamp(30px,5vw,46px)/1.05 var(--display);color:var(--c)} .posture p{margin:0;font-size:15px}
+ul.brief{padding-left:20px;margin:4px 0 8px} ul.brief li{margin:7px 0}
+table.where th{background:var(--soft);color:var(--ink)} table.sevsum{width:auto;min-width:360px;margin:6px 0 12px} table.sevsum tr.tot td{background:var(--soft)}
+th{background:var(--ink);color:var(--paper);border-bottom:0} td.n{text-align:center;font-weight:700;font-family:var(--mono)}
+.env{display:inline-block;font:600 11px var(--mono);padding:1px 7px;background:var(--soft);border:1px solid var(--line);margin:1px 3px 1px 0;white-space:nowrap}
+.env-production{background:rgba(255,74,28,.14);border-color:var(--red)}
+.bars .brow{grid-template-columns:minmax(110px,40%) 1fr 26px}
+.entry{border:2px solid var(--ink);border-left:14px solid var(--ink);padding:18px 24px;margin:22px 0;background:var(--sheet);box-shadow:6px 6px 0 var(--soft)}
+.sc-b-critical{border-left-color:var(--crit)} .sc-b-high{border-left-color:var(--high)} .sc-b-medium{border-left-color:var(--med)} .sc-b-low{border-left-color:var(--low)}
+.entry header{display:grid;grid-template-columns:auto 1fr auto;gap:16px;align-items:start}
+.num{font:900 44px/1 var(--display);color:var(--red)}
+.entry h3{margin:0;font-size:24px}
+.sub{color:var(--muted);font-size:13px;margin-top:3px}
+.score{text-align:right} .score b{display:block;font:900 44px/1 var(--display)} .score small{font:11px var(--mono);color:var(--muted);letter-spacing:.08em}
+.vec{margin:8px 0 0}
+.cols{display:grid;grid-template-columns:1.5fr 1fr;gap:28px;margin-top:10px}
+.why{font-size:13px;color:var(--muted)}
+.fix{background:var(--ink);color:var(--paper);padding:10px 18px;border-top:6px solid var(--lime)} .fix h4{color:var(--lime)} .fix code{background:rgba(255,255,255,.14)}
+.fix a{color:var(--lime)}
+ol.steps{margin:2px 0 6px;padding-left:22px} ol.steps li{margin:6px 0} .verify{font-size:13px}
+.idbtn{white-space:nowrap;font:600 12.5px var(--mono);background:var(--lime);color:var(--ink);border:2px solid var(--ink);padding:2px 9px;cursor:pointer}
+.idbtn::before{content:"+ "} .idbtn[aria-expanded="true"]::before{content:"\\2212 "} .idbtn:hover,.idbtn:focus-visible{background:var(--ink);color:var(--lime)}
+table.where td{overflow-wrap:anywhere}
+tr.evrow>td{background:var(--soft);padding:14px 18px;border-left:6px solid var(--lime)}
+.proof .pmeta{display:flex;flex-wrap:wrap;gap:6px 22px;font:12px var(--mono);color:var(--muted)} .proof .pmeta b{color:var(--ink)}
+.proof figure{margin:10px 0 4px;border:1px solid var(--night);background:var(--night)}
+.proof figcaption{padding:6px 12px;background:var(--night2);font:600 11px var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--lime)}
+.proof pre{margin:0;padding:12px 14px;max-height:360px;overflow:auto;color:#e6edf3;white-space:pre-wrap;word-break:break-word;font:12px/1.55 var(--mono)}
+.proof mark{background:var(--lime);color:var(--ink);padding:0 2px}
+ul.shows{margin:4px 0 10px;padding-left:20px;font-size:13px}
+@media print{tr.evrow[hidden]{display:none}.proof pre{max-height:none}}
+@media (max-width:860px){.cols{grid-template-columns:1fr}.entry{padding:14px}.entry header{grid-template-columns:auto 1fr}.score{grid-column:1/-1;text-align:left}}
+@media print{.entry{break-inside:avoid;box-shadow:none}}
+"""
+
+
+def _cover(client_html: str, title: str, meta: List[Tuple[str, str]], kicker: str) -> str:
+    """The report cover: client name, title and a row of labelled facts."""
+    facts = "".join(f"<div><span>{e(k)}</span>{e(v)}</div>" for k, v in meta)
+    return (f'<header class="cover"><div class="kicker">{e(kicker)}</div>'
+            f'<div><div class="co">{client_html}</div><div class="tt">{e(title)}</div><div class="rule"></div></div>'
+            f'<div class="meta">{facts}</div></header>')
+
+
 def build_report(results: List[dict], source_name: str, model: str, chains: List[dict] = (), client: str = "Client") -> str:
     cl = e(client)
     counts = collections.Counter(r["classification"] for r in results)
@@ -2517,9 +2670,9 @@ def build_report(results: List[dict], source_name: str, model: str, chains: List
         f"<td>{e(r['finding_title'])}</td><td><code>{e(r['asset'])}</code></td><td>{e(r['environment'])}</td><td>{e(r.get('scanner_source'))}</td>"
         f"<td>{_cls_badge(r['classification'])}</td><td>{e(r['confidence'])}</td><td class='reason'>{prose(r['reasoning'])}</td></tr>" for r in results)
 
-    toc = [("confidentiality", "Confidentiality Statement"), ("disclaimer", "Disclaimer"), ("contacts", "Contact Information"),
+    toc = [("audience", "How to Use This Report"), ("confidentiality", "Confidentiality Statement"), ("disclaimer", "Disclaimer"), ("contacts", "Contact Information"),
            ("overview", "Assessment Overview"), ("severity", "Finding Severity Ratings"), ("scope", "Scope"),
-           ("exec", "Executive Summary"), ("attack-summary", "&nbsp;&nbsp;Attack Summary"), ("strengths", "&nbsp;&nbsp;Security Strengths"),
+           ("exec", "Assessment Summary"), ("attack-summary", "&nbsp;&nbsp;Attack Summary"), ("strengths", "&nbsp;&nbsp;Security Strengths"),
            ("weaknesses", "&nbsp;&nbsp;Security Weaknesses"), ("impact", "&nbsp;&nbsp;Vulnerabilities by Impact"),
            ("findings", "Technical Findings"), ("priority", "&nbsp;&nbsp;Top Priority Findings"), ("confirmed", "&nbsp;&nbsp;All Confirmed Findings by Issue Type"),
            ("informational", "Additional Reports and Scans (Informational)"), ("method", "Assessment Method and Limitations"), ("appendix", "Appendix: Every Finding")]
@@ -2527,56 +2680,20 @@ def build_report(results: List[dict], source_name: str, model: str, chains: List
 
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{cl} Security Assessment Findings Report</title>
-<style>
-:root{{--bg:#e9ebef;--paper:#fff;--ink:#1a1f2b;--muted:#5b6475;--line:#d6dae1;--accent:#13294b;--soft:#f1f4f8;--red:#b3261e;
---crit:#8c1230;--high:#c8431a;--med:#c28a14;--low:#3f7a4d;--conf:#b3261e;--fp:#5f8f6b;--nr:#c28a14}}
-*{{box-sizing:border-box;-webkit-print-color-adjust:exact;print-color-adjust:exact}}
-body{{margin:0;background:var(--bg);color:var(--ink);font:14.5px/1.6 Calibri,"Segoe UI",-apple-system,Roboto,Arial,sans-serif}}
-a{{color:#1f4e8c}} .doc{{max-width:930px;margin:24px auto;background:var(--paper);box-shadow:0 2px 14px rgba(0,0,0,.12)}}
-.cover{{padding:120px 64px 90px;background:var(--accent);color:#fff;min-height:520px;display:flex;flex-direction:column;justify-content:center}}
-.cover .co{{font-size:46px;font-weight:700;line-height:1.1}} .cover .tt{{font-size:30px;margin-top:6px;font-weight:300}}
-.cover .rule{{width:90px;height:5px;background:var(--red);margin:26px 0}} .cover p{{margin:2px 0;font-size:16px;opacity:.92}}
-.page{{padding:34px 64px 10px}} h2{{font-size:25px;color:var(--accent);border-bottom:3px solid var(--red);padding-bottom:5px;margin:34px 0 14px;scroll-margin-top:12px}}
-h3{{font-size:19px;color:var(--accent);margin:26px 0 8px;scroll-margin-top:12px}} h4{{font-size:15.5px;color:var(--accent);margin:18px 0 6px}} p{{margin:5px 0 10px}}
-.fcode{{font:600 13px ui-monospace,Menlo,monospace;background:var(--soft);padding:2px 7px;border-radius:5px;margin-right:4px}}
-code{{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;background:rgba(127,127,127,.13);padding:1px 5px;border-radius:4px;word-break:break-word}}
-.muted{{color:var(--muted)}} .toc{{columns:2;column-gap:36px;list-style:none;padding:0}} .toc li{{padding:3px 0;border-bottom:1px dotted var(--line);break-inside:avoid}} .toc a{{text-decoration:none}}
-table{{width:100%;border-collapse:collapse;font-size:13.5px}} th,td{{text-align:left;padding:7px 9px;border:1px solid var(--line);vertical-align:top}}
-table.grid th,table.kv th{{background:var(--accent);color:#fff;font-weight:600}} table.kv th{{width:130px;white-space:nowrap}} table.kv{{margin:8px 0 14px}} table.kv th{{background:var(--soft);color:var(--accent)}}
-td.c{{text-align:center;font-weight:700;width:46px}} .sevcell{{font-weight:700;color:#fff;text-align:center;white-space:nowrap}}
-.sc-critical{{background:var(--crit)}} .sc-high{{background:var(--high)}} .sc-medium{{background:var(--med)}} .sc-low{{background:var(--low)}} .sc-none{{background:#777}}
-.sevtag{{display:inline-block;font-size:12px;font-weight:700;padding:2px 10px;border-radius:999px;color:#fff;vertical-align:middle;margin-left:6px}}
-.sev,.cls,.tier{{display:inline-block;font-size:12px;font-weight:700;padding:1px 9px;border-radius:999px;color:#fff;background:#777;white-space:nowrap}}
-.sev-critical{{background:var(--crit)}} .sev-high{{background:var(--high)}} .sev-medium{{background:var(--med)}} .sev-low{{background:var(--low)}}
-.cls-conf{{background:var(--conf)}} .cls-fp{{background:var(--fp)}} .cls-nr{{background:var(--nr)}}
-.tier{{background:transparent;color:var(--ink);border:1px solid var(--line);font-weight:600}} .tier-chase{{border-color:var(--crit);color:var(--crit)}} .tier-look{{border-color:var(--med);color:var(--med)}}
-.lead{{font-weight:600}} ul.items,ul.plain{{margin:0;padding-left:18px}} ul.plain{{list-style:none;padding:0}} ul.items li{{margin:5px 0}}
-figure{{margin:12px 0;border:1px solid var(--line);border-radius:6px;overflow:hidden;break-inside:avoid}} figure pre{{margin:0;padding:10px 12px;background:#10151f;color:#e6edf7;white-space:pre-wrap;word-break:break-word;font:12px/1.5 ui-monospace,Menlo,monospace}}
-figcaption{{padding:6px 12px;background:var(--soft);font-size:12.5px;color:var(--muted);font-style:italic}} .src{{font-style:normal;text-transform:uppercase;font-size:10.5px;letter-spacing:.05em}}
-ul.chips{{list-style:none;padding:0;margin:8px 0 0;display:flex;flex-wrap:wrap;gap:6px}} .chips li{{border:1px solid var(--line);border-radius:6px;padding:3px 8px;font-size:11.5px;line-height:1.3}} .chips li span{{display:block;color:var(--muted)}} .chips li.hot{{border-color:var(--high);background:rgba(200,67,26,.07)}}
-.note{{font-size:13px;background:var(--soft);padding:6px 10px;border-radius:6px}} .banner{{border:1px solid var(--crit);background:rgba(140,18,48,.07);padding:10px 14px;margin:12px 0}}
-.callout{{border-left:5px solid var(--red);background:var(--soft);padding:12px 16px;margin:12px 0}}
-.twocol{{display:grid;grid-template-columns:1fr 1fr;gap:22px}} .bars{{margin-top:4px}} .brow{{display:grid;grid-template-columns:minmax(140px,42%) 1fr 28px;gap:10px;align-items:center;margin:5px 0;font-size:13px}}
-.bt{{height:14px;background:var(--line);border-radius:3px;overflow:hidden;display:block}} .bf{{display:block;height:100%}} .bv{{text-align:right}} .bl a{{color:var(--ink);text-decoration:none}}
-.donut{{display:flex;align-items:center;gap:16px;flex-wrap:wrap}} .donut svg{{width:140px;height:140px}} .dn{{font:700 28px sans-serif;fill:var(--ink)}} .ds{{font:12px sans-serif;fill:var(--muted)}}
-.legend{{list-style:none;padding:0;margin:0}} .legend li{{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:13px}} .legend i{{width:12px;height:12px;border-radius:3px;display:inline-block}}
-table.heat{{border-collapse:separate;border-spacing:3px}} table.heat th{{border:0;background:none;color:var(--muted);text-align:center;font-size:12px;padding:3px}} table.heat th[scope=row]{{text-align:left;color:var(--ink)}}
-td.hm{{border:0;text-align:center;font-weight:700;border-radius:5px;height:30px;background:color-mix(in srgb,var(--c) calc(var(--a)*100%),transparent)}} td.tot{{border:0;text-align:center;font-weight:700}}
-details{{margin:6px 0;font-size:13px}} summary{{cursor:pointer;color:#1f4e8c;font-weight:600}} ul.proof{{list-style:none;padding:0}} ul.proof li{{border-left:3px solid var(--accent);padding:3px 0 3px 10px;margin:8px 0}} ul.proof li b{{display:block}}
-code.quote{{display:block;white-space:pre-wrap}} details.nrg{{border:1px solid var(--line);padding:8px 12px;border-radius:6px;margin:8px 0}} details.nrg summary small{{display:block;font-weight:400;color:var(--muted)}}
-.count{{font-size:12px;background:var(--soft);padding:1px 8px;border-radius:999px;margin-left:6px}} .tablewrap{{overflow-x:auto}}
-.filters{{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}} .filters input{{flex:1;min-width:200px;padding:7px;border:1px solid var(--line);border-radius:6px}} .filters button{{padding:6px 12px;border:1px solid var(--line);border-radius:6px;background:#fff;cursor:pointer}} .filters button.on{{background:var(--accent);color:#fff}}
-.foot{{padding:20px 64px 40px;color:var(--muted);font-size:12.5px;text-align:center}} td.reason{{min-width:300px}}
-@media (max-width:760px){{.page{{padding:20px 18px}} .cover{{padding:60px 22px}} .twocol{{grid-template-columns:1fr}} .toc{{columns:1}} .cover .co{{font-size:32px}}}}
-@media print{{body{{background:#fff}} .doc{{box-shadow:none;margin:0;max-width:none}} .noprint,.filters{{display:none}} .cover{{min-height:90vh;break-after:page}} .page{{padding:0 6px}}
- h2{{break-before:page;break-after:avoid}} h3,h4{{break-after:avoid}} .finding{{break-before:page}} table,figure,.callout{{break-inside:avoid}} tr{{break-inside:avoid}} @page{{margin:16mm 14mm}}}}
-</style></head><body><div class="doc">
-<header class="cover"><div class="co">{cl}</div><div class="tt">Security Assessment Findings Report</div><div class="rule"></div>
-<p>Business Confidential</p><p>Evidence period: {e(window)}</p><p>Source data: {e(source_name)}</p><p>Version 1.0</p></header>
+<title>{cl} Technical Assessment Report (Analyst Edition)</title>
+{FONT_LINKS}<style>{REPORT_BASE_CSS}{ANALYST_CSS}</style></head><body><div class="doc">
+{_cover(cl, "Technical Assessment Report", [("Edition", "Analyst, for the internal security team"), ("Classification", "Business Confidential"), ("Evidence period", window), ("Source data", source_name), ("Version", "1.0")], "Analyst edition")}
 <div class="page">
 {error_banner}
 <h2 style="break-before:auto">Table of Contents</h2><ol class="toc" style="list-style:none">{toc_html}</ol>
+
+<h2 id="audience">How to Use This Report</h2>
+<p>This is the technical record of the assessment. It is written for the analysts and engineers who verify findings, reproduce them and ship the fixes. Every finding in the source data has a decision here, including the false positives and the findings that need more evidence, each with its reason.</p>
+<p>Each confirmed finding carries its CVSS 3.1 vector with a reason for every metric, the exact evidence it rests on, how the flaw was reproduced and an ordered fix. The companion executive report carries only the confirmed issues, in business terms, for the people who fund and own the risk.</p>
+<table class="kv"><tbody><tr><th>Start with</th><td>Top Priority Findings. Read each entry's evidence figures before the conclusion, then check the CVSS reasoning against your own view of the system.</td></tr>
+<tr><th>Then</th><td>All Confirmed Findings by Issue Type, which lists every affected system once per issue.</td></tr>
+<tr><th>Open questions</th><td>Findings that need more evidence. Treat the follow-up under each one as your test plan.</td></tr>
+<tr><th>Any single row</th><td>The appendix filters all findings by outcome and by text.</td></tr></tbody></table>
 
 <h2 id="confidentiality">Confidentiality Statement</h2>
 <p>This document is the exclusive property of {cl} and the assessment team. It contains proprietary and confidential information. Duplication, redistribution, or use, in whole or in part, in any form, requires consent of both parties.</p>
@@ -2607,7 +2724,7 @@ code.quote{{display:block;white-space:pre-wrap}} details.nrg{{border:1px solid v
 <h4>Scope Exclusions</h4><p>No host was contacted and no new attacks were run. Conclusions rest only on the evidence supplied.</p>
 <h4>Client Allowances</h4><p>{cl} supplied the raw findings with attached evidence: requests, responses, logs, traces, code excerpts, deployment manifests and owner comments. No other access was provided.</p>
 
-<h2 id="exec">Executive Summary</h2>
+<h2 id="exec">Assessment Summary</h2>
 <p>{e(exec_text)}</p>
 <div class="callout"><b>{e('Production exposure: ' + str(len(prod)) + ' confirmed findings, ' + str(prod_hi) + ' High or Critical.')}</b>
  {f"Findings in the same environment also combine into {_plural(n_conf_chains, 'fully confirmed attack chain', 'fully confirmed attack chains')}, described below." if n_conf_chains else ''}</div>
@@ -2659,7 +2776,7 @@ code.quote{{display:block;white-space:pre-wrap}} details.nrg{{border:1px solid v
 <button data-f="" class="on">All</button><button data-f="Confirmed">Confirmed</button><button data-f="False Positive">False positive</button><button data-f="Needs Review">Needs review</button></div>
 <div class="tablewrap"><table id="all" class="grid"><thead><tr><th>ID</th><th>First seen</th><th>Title</th><th>System</th><th>Env</th><th>Raised by</th><th>Outcome</th><th>Conf.</th><th>Reasoning</th></tr></thead>
 <tbody>{all_rows}</tbody></table></div></div>
-</div><div class="foot">{cl} Security Assessment Findings Report &middot; Business Confidential &middot; Version 1.0</div></div>
+</div><div class="foot">{cl} Technical Assessment Report &middot; Analyst Edition &middot; Business Confidential &middot; Version 1.0</div></div>
 <script>
 (function(){{var q=document.getElementById('q'),f='',rows=[].slice.call(document.querySelectorAll('#all tbody tr'));
 function apply(){{var t=q.value.toLowerCase();rows.forEach(function(r){{var ok=(!f||r.dataset.cls===f)&&(!t||r.textContent.toLowerCase().indexOf(t)>-1);r.style.display=ok?'':'none';}});}}
@@ -2694,7 +2811,90 @@ def client_issue_key(r: dict) -> tuple:
     return (issue_key(r), r.get("cvss_vector") or "")
 
 
-def _client_issue(n: int, rows: List[dict]) -> str:
+# ---------------------------------------------------------------------------
+# Audiences
+# ---------------------------------------------------------------------------
+# Two reports, one set of verdicts. The technical report is the working record for the analysts and engineers
+# who verify, reproduce and fix. The executive report is the briefing for the people who fund and own the risk:
+# confirmed issues only, in business terms, with decisions to take. Both are written the way a senior penetration
+# tester would write for that reader.
+RISK_POSTURE = {  # key: (label, colour variable, one-sentence meaning)
+    "critical": ("Critical", "--crit", "A confirmed flaw rated Critical is live in production. Fix it before anything else."),
+    "high": ("High", "--high", "Confirmed flaws rated High are live in production. Fix them in the current planning cycle."),
+    "moderate": ("Moderate", "--med", "Confirmed flaws are live in production, none rated High or Critical. Fix them on a planned schedule."),
+    "contained": ("Contained", "--low", "Confirmed flaws exist, but only outside production. Fix them before the same code ships."),
+    "none": ("No confirmed findings", "--low", "No finding met the standard for confirmation. Items that need more evidence are not cleared."),
+}
+
+
+def risk_posture(confirmed: List[dict]) -> str:
+    """Posture from the worst confirmed severity in production, in plain rules a reader can check."""
+    prod = {r.get("cvss_severity") for r in confirmed if r["environment"].strip().lower() == "production"}
+    for sev, key in (("Critical", "critical"), ("High", "high")):
+        if sev in prod:
+            return key
+    return "moderate" if prod else "contained" if confirmed else "none"
+
+
+PROOF_JS = """
+(function(){
+function set(btn,open){var row=document.getElementById(btn.getAttribute('aria-controls'));if(!row)return;
+row.hidden=!open;btn.setAttribute('aria-expanded',open?'true':'false');}
+[].forEach.call(document.querySelectorAll('.idbtn'),function(b){b.addEventListener('click',function(){set(b,b.getAttribute('aria-expanded')!=='true');});});
+function fromHash(){var id=location.hash.slice(1);if(!id)return;var b=document.querySelector('.idbtn[aria-controls="'+id+'"]');
+if(b){set(b,true);b.scrollIntoView({block:'center'});}}
+window.addEventListener('hashchange',fromHash);fromHash();})();
+"""
+
+
+PROOF_MAX_CHARS = 8000   # a captured field longer than this is cut, keeping the cited quotes in view
+
+
+def _highlight(text: str, quotes: List[str]) -> str:
+    """HTML-escape `text`, wrapping each cited quote in <mark>. Quotes are matched the way the evidence check
+    matched them: whitespace-insensitive and case-insensitive."""
+    spans: List[Tuple[int, int]] = []
+    for q in quotes:
+        words = q.split()
+        if not words:
+            continue
+        m = re.search(r"\s+".join(re.escape(w) for w in words), text, re.I)
+        if m:
+            spans.append(m.span())
+    out, pos = [], 0
+    for a, b in sorted(spans):
+        if a < pos:
+            continue
+        out += [e(text[pos:a]), f"<mark>{e(text[a:b])}</mark>"]
+        pos = b
+    return "".join(out) + e(text[pos:])
+
+
+def _proof_html(r: dict, row: Optional[Dict[str, str]]) -> str:
+    """The evidence behind one confirmed finding: the full text of every captured record it cites, with the
+    quoted lines highlighted. Without the source row, only the quoted lines are shown."""
+    by_field: Dict[str, List[dict]] = {}
+    for c in r.get("evidence") or []:
+        by_field.setdefault(c["field"], []).append(c)
+    blocks = []
+    for field, cites in by_field.items():
+        quotes = [c["quote"] for c in cites]
+        full = (row or {}).get(field) or ""
+        shown = full if len(full) <= PROOF_MAX_CHARS else full[:PROOF_MAX_CHARS] + "\n[... cut for length]"
+        body = _highlight(shown, quotes) if shown else "\n\n".join(e(q) for q in quotes)
+        points = "".join(f"<li>{prose(c.get('supports', ''))}</li>" for c in cites if c.get("supports"))
+        blocks.append(f"<figure><figcaption>{e(FIELD_LABELS.get(field, field))}</figcaption><pre>{body}</pre></figure>"
+                      + (f"<ul class='shows'>{points}</ul>" if points else ""))
+    facts = [("System", r["asset"]), ("Environment", r["environment"]),
+             ("First observed", (r.get("first_observed_utc") or "")[:10]), ("Request ID", (row or {}).get("request_id", ""))]
+    meta = "".join(f"<span><b>{e(k)}</b> {e(v)}</span>" for k, v in facts if v)
+    records = "".join(blocks) or "<p class='muted'>No evidence was recorded.</p>"
+    return (f"<div class='proof'><div class='pmeta'>{meta}</div>"
+            f"<h4>What the evidence shows</h4><p>{prose(r.get('reasoning', ''))}</p>"
+            f"<h4>The records it rests on</h4>{records}</div>")
+
+
+def _client_issue(n: int, rows: List[dict], source: Optional[Dict[str, Dict[str, str]]] = None) -> str:
     lead = rows[0]  # highest-priority instance
     sev = lead.get("cvss_severity") or "None"
     proof = [c.get("supports", "") for c in (lead.get("evidence") or []) if c.get("supports")][:3]
@@ -2702,9 +2902,11 @@ def _client_issue(n: int, rows: List[dict]) -> str:
         prose(p[:1].upper() + p[1:].rstrip(".") + ".") for p in proof) + "</p>") if proof else ""
     prod = sum(1 for r in rows if r["environment"].strip().lower() == "production")
     inst = "".join(
-        f"<tr><td>{e(r['finding_id'])}</td><td><code>{e(r['asset'])}</code></td>"
+        f"<tr><td><button type='button' class='idbtn' aria-expanded='false' aria-controls='ev-{e(r['finding_id'])}'>{e(r['finding_id'])}</button></td>"
+        f"<td><code>{e(r['asset'])}</code></td>"
         f"<td><span class='env env-{e(r['environment'].strip().lower())}'>{e(r['environment'])}</span></td>"
         f"<td>{e((r.get('first_observed_utc') or '')[:10])}</td><td>{e(TIER_LABEL.get(r.get('priority_tier'), ''))}</td></tr>"
+        f"<tr class='evrow' id='ev-{e(r['finding_id'])}' hidden><td colspan='5'>{_proof_html(r, (source or {}).get(r['finding_id']))}</td></tr>"
         for r in sorted(rows, key=lambda r: (r["environment"].strip().lower() != "production", r["asset"], r["finding_id"])))
     note = ("" if len(rows) == 1 else
             f"<p class='why'>Impact and fix are described from the example on <code>{e(lead['asset'])}</code> ({e(lead['finding_id'])}). "
@@ -2718,13 +2920,14 @@ def _client_issue(n: int, rows: List[dict]) -> str:
   <p class="vec"><code>{e(lead.get('cvss_vector') or 'unscored')}</code></p>
   <div class="cols"><section><h4>Business impact</h4>{_impact_block(lead.get('business_impact'))}{why}</section>
   <section class="fix"><h4>Recommended fix</h4>{_client_fix(lead.get('recommended_fix'))}</section></div>
-  <h4 style="margin-top:12px">Where this was found</h4>
+  <h4 style="margin-top:12px">Where this was found <span class="muted">(select a finding ID to see the evidence)</span></h4>
   <table class="where"><thead><tr><th>Finding ID</th><th>Endpoint</th><th>Environment</th><th>First observed</th><th>Fix order</th></tr></thead><tbody>{inst}</tbody></table>
   {note}
 </article>"""
 
 
-def build_client_report(results: List[dict], source_name: str, chains: List[dict] = (), client: str = "Client") -> str:
+def build_client_report(results: List[dict], source_name: str, chains: List[dict] = (), client: str = "Client",
+                        source_rows: Optional[Dict[str, Dict[str, str]]] = None) -> str:
     cl = e(client)
     confirmed = sorted((r for r in results if r["classification"] == "Confirmed"), key=_priority_key)
     sev = collections.Counter(r.get("cvss_severity") for r in confirmed)
@@ -2756,7 +2959,7 @@ def build_client_report(results: List[dict], source_name: str, chains: List[dict
             n_find = sum(len(x) for x in rows_b)
             body += (f"<h2 id='sev-{band.lower()}'>{label} severity <span class='count'>{len(rows_b)} issue{'s' if len(rows_b) != 1 else ''}, "
                      f"{n_find} finding{'s' if n_find != 1 else ''}</span></h2>"
-                     + "".join(_client_issue(number[id(rows)], rows) for rows in rows_b))
+                     + "".join(_client_issue(number[id(rows)], rows, source_rows) for rows in rows_b))
     first = "".join(
         f"<li><b><a href='#issue-{number[id(rows)]}'>{e(display_title(rows[0]))}</a></b> "
         f"<span class='muted'>({len(rows)} system{'s' if len(rows) != 1 else ''}, CVSS {e(rows[0].get('cvss_score'))})</span><br>"
@@ -2776,51 +2979,40 @@ def build_client_report(results: List[dict], source_name: str, chains: List[dict
         f"<tr><td class='sevcell sc-{sv.lower()}'>{lab}</td><td class='n'>{n_issues(sv)}</td><td class='n'>{sev.get(sv, 0)}</td></tr>"
         for sv, lab in (("Critical", "Critical"), ("High", "High"), ("Medium", "Moderate"), ("Low", "Low")))
     sev_table += f"<tr class='tot'><td><b>Total</b></td><td class='n'>{len(issues)}</td><td class='n'>{len(confirmed)}</td></tr>"
+    posture_label, posture_color, posture_text = RISK_POSTURE[risk_posture(confirmed)]
+    n_now = sum(1 for rows in issues if best_tier(rows) == "CHASE")
+    risks = "".join(
+        f"<li><b>{e(display_title(rows[0]))}.</b> {prose((_sentences(rows[0].get('business_impact')) or [''])[0])}</li>" for rows in issues[:3])
+    brief = (f"<li class='lead'>{e(headline)}</li>"
+             + (f"<li>{_plural(n_now, 'issue is', 'issues are')} marked <b>Fix now</b>: the most severe, closest to production.</li>" if n_now else "")
+             + risks)
+    owners = sorted({r.get("asset_owner") for r in confirmed if r.get("asset_owner")})
+    asks = ([f"Approve immediate work on the {n_now} issue{'s' if n_now != 1 else ''} marked Fix now."] if n_now else []) + (
+        [f"Confirm an owner for every issue. Teams named in the records: {e(', '.join(owners))}."] if owners else []) + (
+        [f"Fund the {n_nr} follow-up test{'s' if n_nr != 1 else ''} that would settle the findings the evidence could not decide."] if n_nr else []) + [
+        "Schedule a retest once the fixes ship, to confirm each one holds."]
+    decisions = "".join(f"<li>{d}</li>" for d in asks)
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{cl} Confirmed Security Findings</title>
-<style>
-:root{{--bg:#eceef2;--paper:#fff;--ink:#1a1f2b;--muted:#5b6475;--line:#d9dde4;--accent:#13294b;--soft:#f1f4f8;--red:#b3261e;--crit:#8c1230;--high:#c8431a;--med:#c28a14;--low:#3f7a4d}}
-*{{box-sizing:border-box;-webkit-print-color-adjust:exact;print-color-adjust:exact}}
-body{{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 Calibri,"Segoe UI",-apple-system,Roboto,Arial,sans-serif}}
-a{{color:#1f4e8c}} .doc{{max-width:960px;margin:24px auto;background:var(--paper);box-shadow:0 2px 14px rgba(0,0,0,.12)}}
-.cover{{padding:110px 60px 80px;background:var(--accent);color:#fff}} .cover .co{{font-size:44px;font-weight:700}} .cover .tt{{font-size:28px;font-weight:300;margin-top:4px}}
-.cover .rule{{width:90px;height:5px;background:var(--red);margin:24px 0}} .cover p{{margin:2px 0;opacity:.92}}
-.page{{padding:20px 60px 30px}} h2{{font-size:24px;color:var(--accent);border-bottom:3px solid var(--red);padding-bottom:5px;margin:34px 0 10px;scroll-margin-top:12px}}
-h3{{font-size:18px;margin:0}} h4{{font-size:12.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:4px 0 6px}} p{{margin:5px 0 9px}}
-code{{font:12.5px/1.45 ui-monospace,Menlo,monospace;background:rgba(127,127,127,.13);padding:1px 5px;border-radius:4px;word-break:break-word}} .muted{{color:var(--muted)}}
-.tiles{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:14px 0}} .tile{{border:1px solid var(--line);border-top:5px solid var(--c);border-radius:8px;padding:12px 14px}} .tile b{{display:block;font-size:30px;line-height:1.1}} .tile span{{color:var(--muted);font-size:13px}}
-.callout{{border-left:5px solid var(--red);background:var(--soft);padding:12px 16px;margin:14px 0}} .callout .big{{font-size:19px;font-weight:700}}
-.twocol{{display:grid;grid-template-columns:1fr 1fr;gap:24px}} .bars .brow{{display:grid;grid-template-columns:minmax(110px,40%) 1fr 26px;gap:8px;align-items:center;margin:5px 0;font-size:13px}}
-.bt{{height:13px;background:var(--line);border-radius:3px;overflow:hidden;display:block}} .bf{{display:block;height:100%}} .bv{{text-align:right}} .bl a{{color:var(--ink);text-decoration:none}}
-table{{width:100%;border-collapse:collapse;font-size:13px}} th,td{{text-align:left;padding:6px 8px;border:1px solid var(--line);vertical-align:top}} th{{background:var(--accent);color:#fff}} td.n{{text-align:center;font-weight:700}}
-table.where th{{background:var(--soft);color:var(--accent)}} table.sevsum{{width:auto;min-width:360px;margin:6px 0 12px}} table.sevsum tr.tot td{{background:var(--soft)}}
-.sevcell{{font-weight:700;color:#fff;text-align:center;white-space:nowrap}} .sc-critical{{background:var(--crit)}} .sc-high{{background:var(--high)}} .sc-medium{{background:var(--med)}} .sc-low{{background:var(--low)}} .sc-none{{background:#777}}
-.sevtag{{display:inline-block;font-size:12px;font-weight:700;padding:2px 10px;border-radius:999px;color:#fff}}
-.env{{display:inline-block;font-size:12px;font-weight:600;padding:1px 8px;border-radius:6px;background:var(--soft);border:1px solid var(--line);margin:1px 3px 1px 0;white-space:nowrap}} .env-production{{background:rgba(179,38,30,.12);border-color:var(--red)}}
-table.heat{{border-collapse:separate;border-spacing:3px;width:auto}} table.heat th{{border:0;background:none;color:var(--muted);text-align:center;font-size:12px}} table.heat th[scope=row]{{text-align:left;color:var(--ink)}}
-td.hm{{border:0;text-align:center;font-weight:700;border-radius:5px;min-width:56px;height:30px;background:color-mix(in srgb,var(--c) calc(var(--a)*100%),transparent)}} td.tot{{border:0;text-align:center;font-weight:700}}
-.entry{{border:1px solid var(--line);border-left:6px solid var(--accent);border-radius:8px;padding:14px 18px;margin:16px 0}}
-.sc-b-critical{{border-left-color:var(--crit)}} .sc-b-high{{border-left-color:var(--high)}} .sc-b-medium{{border-left-color:var(--med)}} .sc-b-low{{border-left-color:var(--low)}}
-.entry header{{display:grid;grid-template-columns:36px 1fr auto;gap:12px;align-items:start}} .num{{background:var(--soft);border-radius:50%;width:32px;height:32px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px}}
-.sub{{color:var(--muted);font-size:13px;margin-top:3px}} .score{{text-align:center}} .score b{{display:block;font-size:30px;line-height:1.1}} .score small{{color:var(--muted)}}
-.vec{{margin:6px 0 0}} .cols{{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:8px}} .lead{{font-weight:600}} .why{{font-size:13px;color:var(--muted)}}
-.fix{{background:var(--soft);border-radius:8px;padding:8px 14px}} ol.steps{{margin:2px 0 6px;padding-left:20px}} ol.steps li{{margin:5px 0}} .verify{{font-size:13px}}
-.count{{font-size:13px;font-weight:400;background:var(--soft);padding:1px 9px;border-radius:999px;color:var(--muted)}} .foot{{padding:16px 60px 36px;color:var(--muted);font-size:12.5px;text-align:center}}
-@media (max-width:760px){{.page{{padding:16px 16px}} .cover{{padding:60px 20px}} .twocol,.cols{{grid-template-columns:1fr}} .tiles{{grid-template-columns:repeat(2,1fr)}} .entry header{{grid-template-columns:32px 1fr}} .score{{grid-column:1/-1;text-align:left}}}}
-@media print{{body{{background:#fff}} .doc{{box-shadow:none;margin:0;max-width:none}} .cover{{min-height:90vh;break-after:page}} .page{{padding:0 4px}} h2{{break-before:page}} .entry{{break-inside:avoid}} @page{{margin:16mm 14mm}}}}
-</style></head><body><div class="doc">
-<header class="cover"><div class="co">{cl}</div><div class="tt">Confirmed Security Findings and Remediation Plan</div><div class="rule"></div>
-<p>Confidential</p><p>Evidence period: {e(window)}</p></header>
+<title>{cl} Executive Security Report</title>
+{FONT_LINKS}<style>{REPORT_BASE_CSS}{CLIENT_CSS}</style></head><body><div class="doc">
+{_cover(cl, "Executive Security Report", [("Edition", "Executive, for leadership and risk owners"), ("Classification", "Confidential"), ("Evidence period", window)], "Executive edition")}
 <div class="page">
-<h2 style="break-before:auto">Summary</h2>
-<p>Your security tooling raised {len(results)} findings. Each was checked against the evidence behind it, and <b>{len(confirmed)}</b> are confirmed real.
-Where the same flaw appears on several systems it is reported once, with every affected endpoint and finding ID listed under it. The {len(confirmed)} findings are therefore
-<b>{len(issues)} distinct issues</b>. A <i>finding</i> is one flaw on one system. An <i>issue</i> is the same flaw wherever it occurs. Each issue has its score, business impact and fix.</p>
-<p>The other {len(results) - len(confirmed)} findings are not in this report. {n_fp} were checked and are not exploitable as reported, so no action is needed. {n_nr} could not be decided from the evidence supplied: they are neither confirmed nor ruled out, and each needs one specific follow-up test before it can be settled.</p>
-<div class="callout"><div class="big">{e(headline)}</div>Start with the three issues below.</div>
+<h2 style="break-before:auto">Executive brief</h2>
+<div class="posture" style="--c:var({posture_color})"><span class="plabel">Risk posture</span><b>{e(posture_label)}</b><p>{e(posture_text)}</p></div>
+<h4>What leadership needs to know</h4>
+<ul class="brief">{brief}</ul>
+<h4>Decisions requested</h4>
+<ol class="steps">{decisions}</ol>
 <table class="sevsum"><thead><tr><th>Severity</th><th>Distinct issues</th><th>Findings</th></tr></thead><tbody>{sev_table}</tbody></table>
 <h4>Fix these first</h4><ol class="steps">{first}</ol>
+<p class="muted">Engineers: each issue below lists its CVSS vector, the fix steps and, behind each finding ID, the evidence that proves it. The companion technical report holds the full adjudication.</p>
+
+<h2>About these numbers</h2>
+<p>Your security tooling raised {len(results)} findings. Each was checked against the evidence behind it, and <b>{len(confirmed)}</b> are confirmed real.
+Where the same flaw appears on several systems it is reported once, with every affected endpoint and finding ID listed under it. The {len(confirmed)} findings are therefore
+<b>{len(issues)} distinct issues</b>. A <i>finding</i> is one flaw on one system. An <i>issue</i> is the same flaw wherever it occurs.</p>
+<p>The other {len(results) - len(confirmed)} findings are not in this report. {n_fp} were checked and are not exploitable as reported, so no action is needed. {n_nr} could not be decided from the evidence supplied: they are neither confirmed nor ruled out, and each needs one specific follow-up test before it can be settled.</p>
 <div class="twocol"><div><h4>Findings by environment and severity</h4>{heat}</div><div><h4>Distinct issues by severity</h4>{sev_bars}</div></div>
 
 <h2 id="index">All issues at a glance</h2>
@@ -2830,7 +3022,9 @@ Where the same flaw appears on several systems it is reported once, with every a
 {body}
 <h2>About this report</h2>
 <p>This is a snapshot in time based on the evidence gathered with each finding, from {e(window)}. No new testing was run against any system for this report. The {n_fp} findings shown not to be exploitable and the {n_nr} that need more evidence are not listed here. Repeat the review after fixes ship to confirm that the controls hold.</p>
-</div><div class="foot">{cl} Confirmed Security Findings &middot; Confidential</div></div></body></html>"""
+</div><div class="foot">{cl} Executive Security Report &middot; Confidential</div></div>
+<noscript><style>.evrow[hidden]{{display:table-row}}</style></noscript>
+<script>{PROOF_JS}</script></body></html>"""
 
 
 # ============================================================================
@@ -2877,8 +3071,14 @@ def rebuild_reports(out: Path, source_name: str, source_csv: Optional[Path] = No
     used = summary.get("model_calls_answered") or {}
     model_desc = ", ".join(f"{m} ({n} calls)" for m, n in used.items()) or ", ".join(summary.get("model_chain", []))
     name = client or summary.get("client_name") or "Client"
+    source_rows: Optional[Dict[str, Dict[str, str]]] = None
+    if source_csv:
+        try:
+            source_rows = {r["finding_id"]: r for r in read_findings(source_csv)}
+        except (OSError, InputError) as exc:
+            print(f"warning: the client report will show quoted lines only; could not read {source_csv}: {exc}", file=sys.stderr)
     analyst = build_report(results, source_name, model_desc, chains, name)
-    client_page = build_client_report(results, source_name, chains, name)
+    client_page = build_client_report(results, source_name, chains, name, source_rows)
     (out / "findings_report.html").write_text(analyst, encoding="utf-8")
     (out / "client_report.html").write_text(client_page, encoding="utf-8")
     leftover = report_style_issues(analyst) + report_style_issues(client_page)
@@ -3003,7 +3203,7 @@ def main(argv=None) -> int:
     (out / "run_summary.json").write_text(json.dumps(stats, indent=1), encoding="utf-8")
     page = build_report(results, csv_path.name, model_desc, chains, args.client_name or "Client")
     (out / "findings_report.html").write_text(page, encoding="utf-8")
-    client_page = build_client_report(results, csv_path.name, chains, args.client_name or "Client")
+    client_page = build_client_report(results, csv_path.name, chains, args.client_name or "Client", {r["finding_id"]: r for r in rows})
     (out / "client_report.html").write_text(client_page, encoding="utf-8")
     leftover = report_style_issues(page)
     audit["report_style_issues"] = leftover
@@ -3043,7 +3243,9 @@ def _test_row(**kw):
     return base
 
 
-CHECK_QUOTE = ("observation", "Tenant B session retrieved tenant A vehicle record 4411")
+GOOD_QUOTES = [("observation", "Tenant B session retrieved tenant A vehicle record 4411"),
+               ("raw_response", '{"vehicle":4411,"org":"tenant-a"}')]
+CHECK_QUOTE = GOOD_QUOTES[0]
 
 
 def _test_checklist(cls, category="Authorization", **override):
@@ -3074,10 +3276,6 @@ def _test_assessment(cls, quotes, conf=0.9, observed=True, vector="CVSS:3.1/AV:N
         "report": {"client_title": "t", "cvss_vector": vector if cls == "Confirmed" else "",
                    "cvss_rationale": "", "business_impact": "", "recommended_fix": ""},
     }
-
-
-GOOD_QUOTES = [("observation", "Tenant B session retrieved tenant A vehicle record 4411"),
-               ("raw_response", '{"vehicle":4411,"org":"tenant-a"}')]
 
 
 def _synthetic_findings():
@@ -3340,7 +3538,7 @@ class TestGuidedChecklist(unittest.TestCase):
             r = rubric_for(c)
             self.assertIsNotNone(r, c)
             ids = [cid for cid, _ in r["checks"]]
-            self.assertTrue(2 <= len(ids) <= 8 and len(set(ids)) == len(ids), c)
+            self.assertTrue(len(ids) >= 2 and len(set(ids)) == len(ids), c)
 
     def test_rubric_and_checklist_instruction_reach_the_model_but_unknown_categories_get_none(self):
         self.assertIn("no_check_on_path", user_message("p", "f", render_rubric("Authorization")))
@@ -3591,7 +3789,7 @@ class TestClientReport(unittest.TestCase):
         page = build_client_report([a, b, c], "x.csv")
         self.assertEqual(page.count('<article class="entry'), 2)  # a+b together, c apart
         for r in (a, b, c):
-            self.assertEqual(page.count(f"<td>{r['finding_id']}</td>"), 1)  # each instance listed exactly once
+            self.assertEqual(page.count(f">{r['finding_id']}</button>"), 1)  # each instance listed exactly once
         self.assertIn("other.example.test", page)
 
     def test_summary_issue_and_finding_counts_reconcile(self):
@@ -3607,7 +3805,47 @@ class TestClientReport(unittest.TestCase):
         rows = [dict(a, finding_id=f"TF-8{i:03d}", asset=f"svc{i}.example.test") for i in range(5)]
         page = build_client_report(rows, "x.csv")
         for r in rows:
-            self.assertEqual(page.count(f"<td>{r['finding_id']}</td>"), 1)
+            self.assertEqual(page.count(f">{r['finding_id']}</button>"), 1)
+
+    def test_finding_id_opens_the_full_cited_record_with_the_quote_highlighted(self):
+        res = self._results()
+        row = _test_row(raw_response='HTTP/1.1 200 OK\nX-Trace: 1\n{"vehicle":4411,"org":"tenant-a"}\nend of capture')
+        page = build_client_report(res, "x.csv", source_rows={"T-1": row})
+        self.assertRegex(page, r"<button type='button' class='idbtn' aria-expanded='false' aria-controls='ev-T-1'>T-1</button>")
+        self.assertIn("<tr class='evrow' id='ev-T-1' hidden>", page)
+        self.assertIn("end of capture", page)                          # the whole record, not only the quote
+        self.assertIn("<mark>{&quot;vehicle&quot;:4411,&quot;org&quot;:&quot;tenant-a&quot;}</mark>", page)
+        self.assertEqual(report_style_issues(page), [])
+
+    def test_evidence_without_source_rows_shows_the_quoted_lines_and_escapes_them(self):
+        res = self._results()
+        res[0]["evidence"][0]["quote"] = "<img src=x onerror=alert(1)> tenant record"
+        page = build_client_report(res, "x.csv")
+        self.assertNotIn("<img src=x", page)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt; tenant record", page)
+
+    def test_highlight_matches_across_whitespace_and_case_and_never_breaks_markup(self):
+        out = _highlight("a <b>\nTenant   B read</b> z", ["tenant b READ"])
+        self.assertEqual(out, "a &lt;b&gt;\n<mark>Tenant   B read</mark>&lt;/b&gt; z")
+
+    def test_risk_posture_follows_the_worst_confirmed_severity_in_production(self):
+        mk = lambda sev, env: {"cvss_severity": sev, "environment": env}
+        self.assertEqual(risk_posture([mk("Critical", "production"), mk("Low", "production")]), "critical")
+        self.assertEqual(risk_posture([mk("High", "production"), mk("Critical", "staging")]), "high")
+        self.assertEqual(risk_posture([mk("Medium", "production")]), "moderate")
+        self.assertEqual(risk_posture([mk("Critical", "staging")]), "contained")
+        self.assertEqual(risk_posture([]), "none")
+
+    def test_executive_edition_leads_with_posture_and_decisions_and_the_analyst_edition_says_who_it_is_for(self):
+        res = self._results()
+        page = build_client_report(res, "x.csv")
+        for text in ("Executive brief", "Risk posture", "What leadership needs to know", "Decisions requested", "Executive edition"):
+            self.assertIn(text, page)
+        self.assertEqual(report_style_issues(page), [])
+        analyst = build_report(res, "x.csv", "fake")
+        self.assertIn("How to Use This Report", analyst)
+        self.assertIn("Analyst edition", analyst)
+        self.assertNotIn("Executive Summary", analyst)
 
     def test_client_report_escapes_untrusted_text(self):
         res = self._results()

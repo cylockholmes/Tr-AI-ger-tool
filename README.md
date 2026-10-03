@@ -3,7 +3,7 @@
 # Tr(AI)ger
 
 **Evidence-first triage for noisy security findings.**
-Give it a CSV of raw scanner findings. Get back a verdict for every row, a customer report and an analyst report.
+Give it a CSV of raw scanner findings. Get back a verdict for every row, an executive report and an analyst report.
 
 ![python](https://img.shields.io/badge/python-3.9%2B-3776AB?logo=python&logoColor=white)
 ![dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
@@ -18,8 +18,8 @@ flowchart LR
     T --> A["✅ Confirmed"]
     T --> B["❌ False Positive"]
     T --> C["❓ Needs Review"]
-    A --> R1["client_report.html<br/>for the customer"]
-    A & B & C --> R2["findings_report.html<br/>for the analyst"]
+    A --> R1["client_report.html<br/>executive edition"]
+    A & B & C --> R2["findings_report.html<br/>analyst edition"]
     A & B & C --> R3["classified_findings.csv<br/>+ filled input CSV"]
 ```
 
@@ -176,8 +176,8 @@ The weights are a policy choice, not derived from data. Edit `ENV_WEIGHT`, `TIER
 |---|---|---|
 | `classified_findings.csv` | Everyone | `finding_id`, `classification`, `reasoning`, `confidence`, plus priority, CVSS, decisive boundary, assessor agreement and gate notes |
 | `<input name>-filled.csv` | Everyone | Your input with every original column untouched and `candidate_classification` / `candidate_reasoning` filled. Input order is kept, and rows not assessed stay blank |
-| `client_report.html` | **The customer** | Confirmed findings only, grouped into distinct issues. Each has a CVSS 3.1 score and vector, plain-language impact, ordered fix steps, how to check the fix, and a table of every affected system and finding ID |
-| `findings_report.html` | **The analyst** | Executive summary, attack chains, technical findings with proof of concept, every Needs Review and False Positive with its reason, method, and a searchable appendix of every finding |
+| `client_report.html` | **Executives and risk owners** | The executive edition. Confirmed issues only, in business terms. It opens with an executive brief: a risk posture derived from the worst confirmed severity in production, what leadership needs to know, and the decisions requested. Each issue then has its CVSS 3.1 score, plain-language impact, ordered fix steps and a table of affected systems. Selecting a finding ID opens the evidence that proves it, with the cited lines highlighted |
+| `findings_report.html` | **Internal analysts and engineers** | The technical edition. It opens with how to use the report, then attack chains, technical findings with CVSS reasoning, evidence figures and reproduction, every Needs Review and False Positive with its reason, the method, and a searchable appendix of every finding |
 | `assessments.jsonl` | Reviewer | Full audit trail per row: both reviews, the adjudication, verified and rejected quotes, provenance facts, gate notes |
 | `attack_chains.json` `audit.json` `run_summary.json` | Reviewer | Chains, consistency audit, run statistics, model usage and the agent roster |
 
