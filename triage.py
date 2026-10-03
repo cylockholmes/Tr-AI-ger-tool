@@ -19,6 +19,7 @@ import csv
 import datetime as dt
 import hashlib
 import html
+import io
 import json
 import math
 import re
@@ -51,6 +52,19 @@ CVSS_DIVERGENCE = 1.5            # agreeing Confirmed verdicts this far apart ar
 # should not reorder a customer's remediation list.
 ENV_WEIGHT = {"production": 1.0, "dr-canary": 0.85, "staging": 0.6, "sandbox": 0.5}
 DEFAULT_ENV_WEIGHT = 0.7
+# Other spellings of the weighted environments, so "prod", "PRD" or "uat" weigh like their class. Display keeps the
+# file's own wording.
+ENV_ALIASES = {"prod": "production", "prd": "production", "live": "production", "production": "production",
+               "dr": "dr-canary", "disaster-recovery": "dr-canary", "dr-canary": "dr-canary",
+               "stage": "staging", "stg": "staging", "staging": "staging", "preprod": "staging", "pre-prod": "staging",
+               "uat": "staging", "qa": "staging", "dev": "sandbox", "development": "sandbox", "test": "sandbox",
+               "sandbox": "sandbox", "lab": "sandbox"}
+
+
+def env_class(environment: str) -> str:
+    """The weighted environment class for an environment label; unknown labels are returned lower-cased."""
+    k = re.sub(r"[\s_]+", "-", (environment or "").strip().lower())
+    return ENV_ALIASES.get(k, k)
 TIER_CHASE = 7.0
 TIER_LOOK = 3.0
 
@@ -60,76 +74,384 @@ TIER_LOOK = 3.0
 # code stages. The README documents what each one sees, produces and may not do.
 # ---------------------------------------------------------------------------
 AGENTS = {
-    "Registrar": "code: parses the CSV, extracts provenance facts and dataset-wide context",
+    "Registrar": "code (+ one model call for columns no rule recognises): parses any CSV, maps its columns onto "
+                 "pipeline roles, extracts provenance facts and dataset-wide context",
     "Scout": "model, Assessor A: classifies the finding and proposes CVSS vector, impact and fix",
     "Skeptic": "model, Assessor B: blind second review that tries to refute both outcomes",
-    "Arbiter": "model: decides only when Scout and Skeptic disagree",
+    "Arbiter": "model: decides when Scout and Skeptic disagree on the outcome; casts a third CVSS vote when they "
+               "confirm but score any metric differently",
     "Warden": "code: evidence gates and consistency gate; can only move a verdict toward Needs Review",
-    "Scorekeeper": "code: computes CVSS 3.1 scores, harmonises vectors, assigns priority",
+    "Scorekeeper": "code: combines the reviews' vectors per metric, computes CVSS 3.1 scores, harmonises vectors, "
+                   "assigns priority",
     "Cartographer": "code: correlates confirmed findings into attack chains",
     "Editor": "code: plain-language cleanup of every client-facing sentence",
-    "Publisher": "code: writes the CSV, the analyst report and the client report",
+    "Fact-checker": "model + code: checks every claim in each issue's client-facing text against its evidence; "
+                    "code verifies the quotes; one rewrite, then anything unsupported is flagged for a person",
+    "Publisher": "code: writes the CSVs, the analyst report and the client report (HTML and Markdown)",
 }
 
 
 # ============================================================================
 # CSV input / output
 # ============================================================================
-# Always parsed with the csv module: fields contain quoted
-# commas and embedded newlines, so line- or comma-splitting is wrong.
+# Always parsed with the csv module: fields contain quoted commas and embedded newlines, so line- or comma-splitting
+# is wrong. Any CSV is accepted: the delimiter is sniffed, non-UTF-8 files fall back to Windows-1252, and the
+# columns are mapped onto the pipeline's canonical roles (see "Column mapping" below).
 REQUIRED_COLUMNS = ("finding_id",)
 
-# Columns that are never shown to the model: they are the answer slots.
-HIDDEN_COLUMNS = ("candidate_classification", "candidate_reasoning")
+# Columns that are never shown to the model: they are the answer slots, and the source row number.
+HIDDEN_COLUMNS = ("candidate_classification", "candidate_reasoning", "_row")
 
 
 class InputError(Exception):
     pass
 
 
-def read_findings(path: Path) -> List[Dict[str, str]]:
-    """Read the findings CSV into one dict per row.
+def load_csv(path: Path) -> Tuple[List[str], List[Dict[str, str]]]:
+    """Parse any delimited text file into its header and rows, strictly.
 
-    Fields can hold quoted commas and embedded newlines, so the file is parsed with the csv module in strict mode.
-
-    Args:
-        path: The input CSV.
-
-    Returns:
-        The rows in file order, keyed by column name.
+    The delimiter (comma, semicolon, tab or pipe) is sniffed from the start of the file. UTF-8 (with or without a BOM)
+    is tried first, then Windows-1252. Rows with more or fewer cells than the header are rejected rather than guessed.
 
     Raises:
-        InputError: If the file is unreadable, empty, truncated or malformed, or repeats a finding_id.
+        InputError: If the file is unreadable, empty, has no header, or has a malformed row.
     """
     csv.field_size_limit(min(sys.maxsize, 2**31 - 1))
     try:
-        with open(path, newline="", encoding="utf-8-sig") as fh:
-            reader = csv.DictReader(fh, strict=True)
-            if reader.fieldnames is None:
-                raise InputError(f"{path}: empty file or no header row")
-            missing = [c for c in REQUIRED_COLUMNS if c not in reader.fieldnames]
-            if missing:
-                raise InputError(f"{path}: missing required column(s): {', '.join(missing)}")
-            rows = []
-            for row in reader:
-                if None in row:  # more cells than headers -> malformed row
-                    raise InputError(f"{path}: record ending near line {reader.line_num} has extra cells")
-                if None in row.values():  # fewer cells than headers -> truncated row
-                    raise InputError(f"{path}: record ending near line {reader.line_num} has too few cells")
-                row = {k: (v or "") for k, v in row.items()}
-                if not row["finding_id"].strip():
-                    raise InputError(f"{path}: record ending near line {reader.line_num} has no finding_id")
-                rows.append(row)
-    except UnicodeDecodeError as exc:
-        raise InputError(f"{path}: not valid UTF-8 ({exc})") from exc
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise InputError(f"{path}: cannot read ({exc})") from exc
+    for encoding in ("utf-8-sig", "cp1252"):
+        try:
+            text = raw.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        raise InputError(f"{path}: not valid UTF-8 or Windows-1252 text")
+    if encoding != "utf-8-sig":
+        print(f"notice: {path.name} is not UTF-8; read as Windows-1252", file=sys.stderr)
+    try:
+        delimiter = csv.Sniffer().sniff(text[:65536], delimiters=",;\t|").delimiter
+    except csv.Error:
+        delimiter = ","
+    try:
+        reader = csv.DictReader(io.StringIO(text, newline=""), delimiter=delimiter, strict=True)
+        if not reader.fieldnames or not any(h.strip() for h in reader.fieldnames):
+            raise InputError(f"{path}: empty file or no header row")
+        headers = [h.strip() for h in reader.fieldnames]
+        if len(set(headers)) != len(headers):
+            raise InputError(f"{path}: repeated column name(s): "
+                             + ", ".join(sorted(h for h, n in collections.Counter(headers).items() if n > 1)))
+        reader.fieldnames = headers
+        rows = []
+        for row in reader:
+            if None in row:  # more cells than headers -> malformed row
+                raise InputError(f"{path}: record ending near line {reader.line_num} has extra cells")
+            if None in row.values():  # fewer cells than headers -> truncated row
+                raise InputError(f"{path}: record ending near line {reader.line_num} has too few cells")
+            if any((v or "").strip() for v in row.values()):  # skip fully blank lines
+                rows.append({k: (v or "") for k, v in row.items()})
     except csv.Error as exc:
         raise InputError(f"{path}: not valid CSV ({exc})") from exc
-    ids = [r["finding_id"] for r in rows]
-    dupes = sorted(i for i, n in collections.Counter(ids).items() if n > 1)
-    if dupes:
-        raise InputError(f"{path}: duplicate finding_id(s): {', '.join(dupes[:10])}")
     if not rows:
         raise InputError(f"{path}: no findings")
+    return headers, rows
+
+
+# ---------------------------------------------------------------------------
+# Column mapping
+# ---------------------------------------------------------------------------
+# The pipeline works on canonical column names. A file that already uses them maps onto itself. Other files are
+# mapped by (1) exact canonical names, (2) common aliases, (3) optionally one model call for the columns still
+# unplaced, and (4) a user-supplied --column-map JSON, which always wins. A column with no canonical role keeps its
+# data under "<kind>.<name>", where the kind says what the evidence is worth to the gates:
+#   capture   direct runtime capture: requests, responses, tool output, logs, traces      (runtime, can confirm)
+#   observed  a person's account of a test that was run                                    (runtime narrative)
+#   code      source, configuration, manifests
+#   claim     assertions by interested parties: owner or ticket comments, claimed mitigations (never proof alone)
+#   context   descriptions, network or identity context, references, recommendations
+#   quality   notes on evidence gaps, sampling or collection problems
+#   label     scanner labels: scores, severities, IDs, dates                               (shown, never quotable)
+#   answer    an existing verdict or triage decision                                       (hidden from the model)
+#   ignore    empty or irrelevant                                                           (hidden from the model)
+FIELD_KINDS = ("capture", "observed", "code", "claim", "context", "quality", "label", "answer", "ignore")
+CANONICAL_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "finding_id": ("id", "vuln_id", "vulnerability_id", "issue_id", "alert_id", "record_id", "ref", "reference", "uid", "uuid"),
+    "finding_title": ("title", "name", "vulnerability", "vulnerability_name", "vuln_name", "issue", "issue_name",
+                      "summary", "plugin_name", "check_name", "rule_name", "alert", "alert_name", "finding_name"),
+    "category": ("type", "vuln_type", "vulnerability_type", "finding_type", "issue_type", "cwe", "family", "plugin_family"),
+    "asset": ("host", "hostname", "target", "url", "uri", "endpoint", "ip", "ip_address", "resource", "component",
+              "service", "application", "app", "system", "fqdn", "domain", "location", "affected_asset"),
+    "environment": ("env", "stage", "tier", "zone", "network_zone"),
+    "asset_owner": ("owner", "team", "owning_team", "assignee", "business_unit"),
+    "scanner_source": ("scanner", "tool", "source_tool", "detected_by", "scanner_name", "engine", "detection_source"),
+    "scanner_rule": ("rule", "rule_id", "plugin_id", "check_id", "template_id", "signature", "cve", "cve_id"),
+    "scanner_severity": ("severity", "risk", "risk_rating", "risk_level", "criticality", "cvss", "cvss_score", "base_score"),
+    "scanner_confidence": ("confidence", "certainty"),
+    "first_observed_utc": ("first_seen", "first_observed", "first_detected", "discovered", "discovered_at", "detected_at",
+                           "created", "created_at", "date", "timestamp", "found_at", "observed_at"),
+    "last_observed_utc": ("last_seen", "last_observed", "last_detected", "updated", "updated_at"),
+    "request_id": ("correlation_id", "x_request_id"),
+    "raw_request": ("request", "http_request"),
+    "raw_response": ("response", "http_response"),
+    "raw_http_exchange": ("http_exchange", "http_transaction"),
+    "validation_attempt": ("validation", "verification", "reproduction", "steps_to_reproduce", "repro_steps"),
+    "mixed_service_logs": ("logs", "log", "service_logs", "log_excerpt"),
+    "distributed_trace_excerpt": ("trace", "traces", "trace_excerpt"),
+    "source_code_excerpt": ("code", "code_snippet", "snippet", "source_code"),
+    "code_or_config_context": ("config", "configuration", "config_context"),
+    "deployment_manifest_excerpt": ("manifest", "deployment_manifest"),
+    "claimed_compensating_controls": ("compensating_controls", "mitigations", "mitigation", "controls"),
+    "ticket_comment_thread": ("comments", "comment", "ticket_comments", "notes", "discussion"),
+    "evidence_gaps": ("gaps", "known_gaps"),
+}
+# Columns that hold an existing verdict are hidden from the model so it cannot copy the answer.
+ANSWER_ALIASES = ("status", "verdict", "triage_status", "triage", "resolution", "disposition", "false_positive",
+                  "is_false_positive", "state")
+# Common column names whose evidence kind is clear from the name alone.
+KIND_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "capture": ("plugin_output", "output", "tool_output", "proof", "http_traffic", "request_response", "evidence_output",
+                "captured_response", "response_body"),
+    "observed": ("poc", "proof_of_concept", "test_result", "test_results", "exploitation", "exploit_result"),
+    "claim": ("analyst_notes", "dev_notes", "developer_notes", "owner_notes", "owner_comment", "remarks",
+              "justification", "risk_acceptance", "exception_reason"),
+    "context": ("description", "synopsis", "solution", "remediation", "recommendation", "see_also", "references",
+                "impact_description", "details"),
+}
+_KIND_PREFIX = re.compile(r"^(%s)\." % "|".join(FIELD_KINDS))
+
+
+def _header_key(h: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", h.strip().lower()).strip("_")
+
+
+def canonical_names() -> List[str]:
+    return [f for _, fields in FIELD_ORDER for f in fields] + list(HIDDEN_COLUMNS[:2])
+
+
+def heuristic_mapping(headers: Sequence[str]) -> Dict[str, Optional[str]]:
+    """Source column -> canonical name or "<kind>.<name>", or None when no rule places it."""
+    canon = canonical_names()
+    out: Dict[str, Optional[str]] = {}
+    taken: set = set()
+    for h in headers:  # exact canonical names first, so they are never displaced by an alias
+        if _header_key(h) in canon and _header_key(h) not in taken:
+            out[h] = _header_key(h)
+            taken.add(out[h])
+    for h in headers:
+        if h in out:
+            continue
+        k = _header_key(h)
+        if k in ANSWER_ALIASES:
+            out[h] = f"answer.{k}"
+            continue
+        kind = next((kd for kd, names in KIND_ALIASES.items() if k in names), None)
+        if kind:
+            out[h] = f"{kind}.{k}"
+            continue
+        role = next((c for c, aliases in CANONICAL_ALIASES.items() if k in aliases and c not in taken), None)
+        out[h] = role
+        if role:
+            taken.add(role)
+    return out
+
+
+SCHEMA_MAP_SCHEMA = {
+    "type": "object",
+    "properties": {"columns": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"column": {"type": "string"}, "role": {"type": "string"}},
+        "required": ["column", "role"]}}},
+    "required": ["columns"],
+}
+# What each canonical role means, for the model that places unrecognised columns. scanner_raw_output is not offered:
+# it is a scanner label, and a tool's captured output for this instance is runtime evidence (kind "capture").
+CANONICAL_HINTS = {
+    "finding_id": "unique ID of the finding", "finding_title": "short name of the finding",
+    "category": "vulnerability class or type", "asset": "affected host, URL, IP, service or component",
+    "environment": "production, staging, dev and so on", "asset_owner": "owning team or person",
+    "scanner_source": "the tool that reported it", "scanner_rule": "rule, plugin, check or CVE ID",
+    "scanner_severity": "severity or risk rating given by the tool", "scanner_confidence": "the tool's confidence",
+    "first_observed_utc": "date or time first found or reported", "last_observed_utc": "date or time last seen",
+    "request_id": "request or correlation ID", "raw_request": "captured HTTP request",
+    "raw_response": "captured HTTP response", "raw_http_exchange": "captured request and response together",
+    "observation": "a tester's description of what they observed", "validation_attempt": "how the finding was verified",
+    "mixed_service_logs": "log lines", "distributed_trace_excerpt": "trace spans",
+    "source_code_excerpt": "source code", "code_or_config_context": "configuration or code context",
+    "deployment_manifest_excerpt": "deployment manifest", "identity_network_context": "network or identity context",
+    "claimed_compensating_controls": "claimed mitigations", "contradictory_evidence": "evidence against the finding",
+    "ticket_comment_thread": "comments from owners or tickets", "evidence_gaps": "what was not tested",
+    "evidence_collection_warnings": "problems collecting the evidence",
+}
+SCHEMA_MAP_SYSTEM = """You map the columns of a security-findings spreadsheet onto a triage pipeline's roles. Column names
+may be in any language. For each column you are given, return one role. Either a canonical role, used at most once:
+{canonical}
+or one evidence kind:
+  capture (raw captured requests, responses, tool or plugin output, logs, traces), observed (a person's account of a
+  test that was run), code (source, configuration, manifests), claim (statements by owners, developers or tickets,
+  claimed mitigations), context (descriptions, network or identity context, references, remediation advice),
+  quality (notes on evidence gaps or collection problems), label (scanner labels: scores, severities, IDs, dates,
+  counts), answer (an existing verdict or triage decision about the finding), ignore (empty or irrelevant).
+Judge from the column name AND the sample values. Prefer a weaker kind when unsure: context over capture, label over
+context, except that a tool's output showing what happened for THIS finding (its request, response or result) is
+capture. Return every column you were given, spelled exactly."""
+
+
+def model_mapping(headers: Sequence[str], rows: Sequence[Dict[str, str]], unplaced: Sequence[str],
+                  taken: Sequence[str], llm: "LLMBackend") -> Dict[str, str]:
+    """Ask the model to place the columns no rule could place. Code validates every answer: unknown columns are
+    dropped, a canonical role already taken (or claimed twice) falls back to context, an unknown role to context."""
+    free = [c for c in CANONICAL_HINTS if c not in taken]
+    samples = []
+    for h in unplaced:
+        vals = [r[h].strip() for r in rows if r.get(h, "").strip()][:3]
+        samples.append(f"<column name={json.dumps(h)}>\n" + "\n---\n".join(v[:240] for v in vals) + "\n</column>")
+    canon = "\n".join(f"  {c}: {CANONICAL_HINTS[c]}" for c in free)
+    out = llm.complete("schema", SCHEMA_MAP_SYSTEM.replace("{canonical}", canon), SCHEMA_MAP_SCHEMA,
+                       "All columns: " + ", ".join(headers) + "\n\nColumns to place, with sample values:\n" + "\n".join(samples))
+    placed: Dict[str, str] = {}
+    used = set(taken)
+    for item in out.get("columns", []):
+        col, role = item.get("column"), (item.get("role") or "").strip().lower()
+        if col not in unplaced or col in placed:
+            continue
+        if role in free and role not in used:
+            placed[col], _ = role, used.add(role)
+        elif role in FIELD_KINDS:
+            placed[col] = f"{role}.{_header_key(col) or 'column'}"
+        else:
+            placed[col] = f"context.{_header_key(col) or 'column'}"
+    return placed
+
+
+def infer_mapping(headers: Sequence[str], rows: Sequence[Dict[str, str]], llm: Optional["LLMBackend"] = None,
+                  override: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """The full source-column -> pipeline-key mapping. Rules first; the model only for what rules leave unplaced; the
+    user's override last. Without a model, unplaced columns become context (quotable, never runtime proof)."""
+    mapping = heuristic_mapping(headers)
+    unplaced = [h for h, v in mapping.items() if v is None]
+    if unplaced and llm is not None:
+        try:
+            mapping.update(model_mapping(headers, rows, unplaced, [v for v in mapping.values() if v], llm))
+        except LLMError as exc:
+            print(f"warning: column mapping by model failed ({exc}); unplaced columns are treated as context", file=sys.stderr)
+    for h, v in list(mapping.items()):
+        if v is None:
+            mapping[h] = f"context.{_header_key(h) or 'column'}"
+    for h, v in (override or {}).items():
+        if h not in mapping:
+            raise InputError(f"--column-map names a column the file does not have: {h!r}")
+        if v not in canonical_names() and not _KIND_PREFIX.match(v):
+            raise InputError(f"--column-map role for {h!r} must be a canonical column or '<kind>.<name>' with kind in "
+                             f"{', '.join(FIELD_KINDS)}: got {v!r}")
+        mapping[h] = v
+    # Two columns on one key: the later one keeps its data as context.
+    seen: set = set()
+    for h in headers:
+        if mapping[h] in seen:
+            mapping[h] = f"context.{_header_key(h) or 'column'}"
+        seen.add(mapping[h])
+    return mapping
+
+
+_DATE_FORMATS = ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S",
+                 "%Y/%m/%d", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y", "%d %b %Y", "%b %d, %Y", "%B %d, %Y",
+                 "%d-%b-%Y", "%a, %d %b %Y %H:%M:%S")
+
+
+def normalise_timestamp(value: str) -> str:
+    """ISO 8601 UTC ('2026-07-01T13:00:00Z') for common date formats and epoch seconds; anything else unchanged.
+    Ambiguous day/month dates are read as US month/day."""
+    v = (value or "").strip()
+    if not v:
+        return ""
+    try:
+        d = dt.datetime.fromisoformat(v.replace("Z", "+00:00"))
+    except ValueError:
+        d = None
+        if re.fullmatch(r"\d{10}(\.\d+)?", v):
+            d = dt.datetime.fromtimestamp(float(v), tz=dt.timezone.utc)
+        for fmt in _DATE_FORMATS:
+            if d:
+                break
+            try:
+                d = dt.datetime.strptime(re.sub(r"\s*(UTC|GMT|Z)$", "", v), fmt)
+            except ValueError:
+                continue
+    if d is None:
+        return v
+    if d.tzinfo:
+        d = d.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    return d.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def apply_mapping(rows: Sequence[Dict[str, str]], mapping: Dict[str, str], source: str = "input") -> List[Dict[str, str]]:
+    """Rename every row onto pipeline keys and fill what the reports need. Nothing is invented: a missing or
+    non-unique ID becomes the row number (the original kept as a label), a missing title or asset becomes
+    'Untitled finding' / 'Unspecified asset', and timestamps are normalised to ISO 8601 where their format is known.
+
+    Raises:
+        InputError: If an explicit finding_id column repeats an ID or leaves one blank.
+    """
+    out = []
+    for i, raw in enumerate(rows, 1):
+        row = {mapping[h]: v for h, v in raw.items()}
+        row["_row"] = str(i)
+        out.append(row)
+    explicit = any(h == "finding_id" for h in mapping)  # the file's own finding_id column is a contract
+    ids = [r.get("finding_id", "").strip() for r in out]
+    blanks = [i for i, x in enumerate(ids, 1) if not x]
+    dupes = sorted(x for x, n in collections.Counter(ids).items() if x and n > 1)
+    if explicit and (blanks or dupes):
+        if blanks:
+            raise InputError(f"{source}: record {blanks[0]} has no finding_id")
+        raise InputError(f"{source}: duplicate finding_id(s): {', '.join(dupes[:10])}")
+    if "finding_id" not in mapping.values() or blanks or dupes:
+        if "finding_id" in mapping.values():
+            print(f"notice: the ID column is blank or repeated in {source}; findings are numbered by row "
+                  f"(the original value is kept as label.source_id)", file=sys.stderr)
+        width = max(4, len(str(len(out))))
+        for r in out:
+            if r.get("finding_id", "").strip():
+                r["label.source_id"] = r["finding_id"]
+            r["finding_id"] = f"ROW-{int(r['_row']):0{width}d}"
+    for r in out:
+        r["finding_id"] = r["finding_id"].strip()
+        r.setdefault("finding_title", "")
+        if not r["finding_title"].strip():
+            r["finding_title"] = (r.get("category") or r.get("scanner_rule") or "Untitled finding").strip()
+        if not (r.get("asset") or "").strip():
+            r["asset"] = "Unspecified asset"
+        if not (r.get("environment") or "").strip():
+            r["environment"] = "unspecified"
+        for k in ("first_observed_utc", "last_observed_utc"):
+            if r.get(k):
+                r[k] = normalise_timestamp(r[k])
+    return out
+
+
+def read_findings(path: Path, mapping: Optional[Dict[str, str]] = None, llm: Optional["LLMBackend"] = None,
+                  override: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
+    """Read any findings CSV into one dict per row, keyed by pipeline column names.
+
+    Args:
+        path: The input file.
+        mapping: A saved source-column mapping to reuse (a rebuild); inferred when omitted.
+        llm: Optional model for placing columns no rule recognises.
+        override: User mapping (--column-map) that wins over everything else.
+
+    Returns:
+        The rows in file order. Each carries "_row" (its 1-based position in the file).
+
+    Raises:
+        InputError: If the file cannot be parsed, or its own finding_id column is blank or repeated.
+    """
+    headers, raw = load_csv(path)
+    if mapping is None or set(mapping) != set(headers):
+        mapping = infer_mapping(headers, raw, llm, override)
+    rows = apply_mapping(raw, mapping, str(path))
+    read_findings.last_mapping = mapping  # type: ignore[attr-defined]
     return rows
 
 
@@ -161,22 +483,23 @@ def _csv_cell(value: object) -> str:
     return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
 
 
-def write_filled_input(path: Path, source_csv: Path, results: List[Dict[str, object]]) -> int:
-    """Write a copy of the input CSV with every original column kept as supplied and
-    the two answer columns (candidate_classification, candidate_reasoning) filled
-    from the final verdicts. Rows keep the input order; rows that were not assessed
-    (--ids / --limit) are left blank. Returns the number of rows filled."""
-    rows = read_findings(source_csv)
-    by_id = {str(r["finding_id"]): r for r in results}
-    with open(source_csv, newline="", encoding="utf-8-sig") as fh:
-        fields = list(csv.DictReader(fh).fieldnames or [])
-    fields += [c for c in HIDDEN_COLUMNS if c not in fields]
+def write_filled_input(path: Path, source_csv: Path, results: List[Dict[str, object]],
+                       rows: Optional[List[Dict[str, str]]] = None) -> int:
+    """Write a copy of the input with every original column kept as supplied and the two answer columns
+    (candidate_classification, candidate_reasoning) added or filled from the final verdicts. Rows keep the input
+    order and are matched by position, so any input format works; rows not assessed (--ids / --limit) stay blank.
+    Returns the number of rows filled."""
+    headers, raw = load_csv(source_csv)
+    rows = rows if rows is not None else read_findings(source_csv)
+    pos = {r["finding_id"]: int(r["_row"]) for r in rows}
+    by_row = {pos[str(r["finding_id"])]: r for r in results if str(r["finding_id"]) in pos}
+    fields = headers + [c for c in HIDDEN_COLUMNS[:2] if c not in headers]
     filled = 0
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
-        for row in rows:
-            res = by_id.get(row["finding_id"])
+        for i, row in enumerate(raw, 1):
+            res = by_row.get(i)
             if res:
                 row["candidate_classification"] = str(res["classification"])
                 row["candidate_reasoning"] = _csv_cell(res.get("reasoning"))
@@ -344,15 +667,49 @@ CLAIM_FIELDS = frozenset({"claimed_compensating_controls", "ticket_comment_threa
 METADATA_FIELDS = frozenset(FIELD_ORDER[0][1] + FIELD_ORDER[1][1])
 
 
+def field_kind(f: str) -> str:
+    """The evidence kind of a pipeline key: a canonical column's kind, or the "<kind>." prefix of a mapped column."""
+    if f in HIDDEN_COLUMNS:
+        return "answer"
+    if f in METADATA_FIELDS:
+        return "label"
+    if f in NARRATIVE_RUNTIME_FIELDS:
+        return "observed"
+    if f in RUNTIME_FIELDS:
+        return "capture"
+    if f in CLAIM_FIELDS:
+        return "claim"
+    m = _KIND_PREFIX.match(f)
+    return m.group(1) if m else "context"
+
+
+def is_runtime(f: str) -> bool:
+    return field_kind(f) in ("capture", "observed")
+
+
+def is_capture(f: str) -> bool:
+    """A captured request, response, exchange, log, trace or tool output, as opposed to someone's account of a test."""
+    return field_kind(f) == "capture"
+
+
+def is_claim(f: str) -> bool:
+    return field_kind(f) == "claim"
+
+
 def quotable_fields(row: Dict[str, str]) -> List[str]:
-    """List the row's columns that may be quoted as evidence, leaving out hidden answer columns and scanner metadata."""
-    return [k for k in row if k not in HIDDEN_COLUMNS and k not in METADATA_FIELDS]
+    """List the row's columns that may be quoted as evidence, leaving out hidden answer columns and scanner labels."""
+    return [k for k in row if field_kind(k) not in ("answer", "ignore", "label")]
 
 
 def render_packet(row: Dict[str, str]) -> str:
     """Render a row as the labelled evidence packet the models read, grouped by kind of evidence."""
     known = {f for _, fields in FIELD_ORDER for f in fields}
-    groups = FIELD_ORDER + [("Other fields", [f for f in row if f not in known and f not in HIDDEN_COLUMNS])]
+    extra = [f for f in row if f not in known and field_kind(f) not in ("answer", "ignore")]
+    kind_heading = {"label": "Other scanner labels (UNTRUSTED)", "capture": "Other runtime captures",
+                    "observed": "Other test accounts", "code": "Other code and configuration",
+                    "claim": "Other claims (assertions, not proof)", "quality": "Other evidence-quality notes",
+                    "context": "Other context"}
+    groups = FIELD_ORDER + [(kind_heading[k], [f for f in extra if field_kind(f) == k]) for k in kind_heading]
     out = []
     for heading, fields in groups:
         block = [f"<field name=\"{f}\">\n{row[f]}\n</field>" for f in fields if f in row]
@@ -686,6 +1043,57 @@ ADJUDICATION_SCHEMA["properties"]["adjudication_note"] = {
 }
 ADJUDICATION_SCHEMA["required"].append("adjudication_note")
 
+# The Fact-checker reads only what the client will read (title, impact, factual statements inside the fix) against
+# the evidence of the finding the text was written from. It never touches a verdict or a score.
+FACT_STATUSES = ("supported", "inference", "not_tested", "unsupported")
+FACTCHECK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "claims": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "field": {"type": "string", "enum": ["client_title", "business_impact", "recommended_fix"]},
+                    "claim": {"type": "string", "description": "One atomic factual claim, in the text's own words."},
+                    "status": {"type": "string", "enum": list(FACT_STATUSES)},
+                    "quote": {"type": "string", "description": "For supported: verbatim text from the packet that "
+                                                               "states the claim. Otherwise empty."},
+                    "note": {"type": "string", "description": "For unsupported: what the packet actually says."},
+                },
+                "required": ["field", "claim", "status", "quote", "note"],
+            },
+        },
+        "revised_title": {"type": "string", "description": "Only if the title has an unsupported claim; else empty."},
+        "revised_impact": {"type": "string", "description": "Only if the impact has an unsupported claim; else empty."},
+    },
+    "required": ["claims", "revised_title", "revised_impact"],
+}
+FACTCHECK_SYSTEM = """You fact-check the client-facing text of a security report against the evidence packet of
+the one finding it was written from. You do not judge whether the finding is real or how it is scored.
+
+Split the title and the impact into atomic factual claims. In the recommended fix, check only statements of fact
+about the system or the evidence (e.g. "the key was unrestricted"); skip advice. Give each claim one status:
+- supported: the packet states it. Quote the packet verbatim (at least 16 characters, copied exactly) in `quote`.
+- inference: it follows directly and generically from a demonstrated primitive without naming any data, system,
+  person or consequence the packet does not mention (e.g. "code execution lets an attacker run commands as the
+  service").
+- not_tested: the text says something was not tested, not shown or not attempted, and the packet agrees.
+- A claim framed as REACHABLE rather than demonstrated ("the same access could reach X") is supported when the packet
+  itself states that X is accessible to the affected component (e.g. "worker shares a writable volume with report
+  templates"); quote that statement. It is unsupported when X or its accessibility comes from nowhere in the packet.
+- unsupported: anything else. In particular: data types, systems, scopes or attacker actions the packet does not
+  name; follow-on movement, downtime, legal, contractual, regulatory or financial consequences; a test described as
+  a real-world event; an effect the packet says was blocked or not attempted described as having happened; the
+  access an attacker needs stated more loosely than the CVSS vector given; a statement that rests only on an owner
+  comment, ticket thread or claimed control but is presented as established fact rather than attributed ("the owner
+  states ...").
+
+If any claim in the title or impact is unsupported, write revised_title and/or revised_impact that remove or
+correct only those claims, keep every supported claim, use plain language for an executive, add nothing new, and
+keep the impact to 2-3 sentences (a title is a noun phrase of at most 12 words). Otherwise leave them empty.
+Never mention yourself, a model, AI or these rules."""
+
 
 # ---------------------------------------------------------------------------
 # Category rubrics and guided checklists
@@ -847,9 +1255,32 @@ RUBRICS: Dict[str, Dict[str, object]] = {
 }
 
 
+# Category wording differs between tools ("SQL Injection", "CWE-89", "IDOR"); these keywords find the rubric when
+# the category is not one of the rubric names. First match wins, so the more specific patterns come first.
+RUBRIC_KEYWORDS = [
+    (r"ssrf|server.side request", "Server-Side Request Forgery"), (r"path traversal|directory traversal|lfi|cwe-22\b", "Path Traversal"),
+    (r"upload|archive|zip.?slip", "File Upload"), (r"rce|remote code|code exec|eval|deseriali|cwe-(94|95|502)\b", "Code Execution"),
+    (r"inject|sqli|cwe-(78|89)\b", "Injection"), (r"oauth|redirect|cwe-601\b", "OAuth"),
+    (r"cors|xss|cross.site|csrf|clickjack|cwe-(79|352|942)\b", "Browser Security"),
+    (r"secret|api key|credential.*(exposed|leak|hard)|hard.?coded|cwe-(798|540)\b", "Secret Detection"),
+    (r"password reset|account recovery|reset token|cwe-640\b", "Account Recovery"),
+    (r"idor|access control|authori[sz]|privilege|tenant|cwe-(639|862|863|284)\b", "Authorization"),
+    (r"authenticat|login|session|jwt|token|enumerat|cwe-(287|347|204)\b", "Authentication"),
+    (r"crypt|random|prng|cipher|tls|ssl|hash|cwe-(327|330|338)\b", "Cryptography"),
+    (r"race|concurren|toctou|cwe-362\b", "Concurrency"),
+    (r"disclos|exposure|debug|stack trace|verbose|information leak|cwe-(200|209|489)\b", "Information Exposure"),
+]
+
+
 def rubric_for(category: str) -> Optional[Dict[str, object]]:
-    """Return the rubric for a finding category, or None when the category has none."""
-    return RUBRICS.get((category or "").strip())
+    """Return the rubric for a finding category (by name, else by keyword), or None when no rubric fits."""
+    c = (category or "").strip()
+    if c in RUBRICS:
+        return RUBRICS[c]
+    for pattern, name in RUBRIC_KEYWORDS:
+        if re.search(pattern, c, re.I):
+            return RUBRICS[name]
+    return None
 
 
 def render_rubric(category: str) -> str:
@@ -863,7 +1294,7 @@ def render_rubric(category: str) -> str:
             f"Checklist (answer every id, in the `checklist` field, before you classify):\n{checks}")
 
 
-_COMMON_RULES_TEMPLATE = """
+_COMMON_RULES = """
 # Ground rules (non-negotiable)
 - All targets and evidence are synthetic. Use ONLY facts present in the evidence packet. Never add facts.
 - Scanner severity, confidence, rule names and titles are unreliable labels, not evidence.
@@ -938,9 +1369,10 @@ _COMMON_RULES_TEMPLATE = """
 # Evidence citations
 - Provide {min_cites}-6 citations. Each `quote` must be copied EXACTLY (verbatim substring, {min_chars}-200 chars) from
   the named field. Citations are machine-verified against the packet; fabricated or paraphrased quotes cause automatic
-  downgrade. Scanner labels and identifiers ({metadata}) are not evidence and do not count;
+  downgrade. Scanner labels and identifiers ({metadata}, and any field named label.*) are not evidence and do not count;
   a quote must say something beyond the request ID.
-- For Confirmed, at least one citation must come from a runtime field ({runtime}).
+- For Confirmed, at least one citation must come from a runtime field ({runtime}, or a field named capture.* or
+  observed.*). Fields named claim.* are assertions, like owner comments.
 - For False Positive, at least one citation must come from something other than claims/ticket comments, and if the
   release bot reports that the image differs from the source attachment, at least one must come from a runtime field.
 
@@ -963,19 +1395,43 @@ _COMMON_RULES_TEMPLATE = """
   code-evaluating function is code execution in that process, even if the test only ran a harmless probe; a forged
   token accepted as admin grants that role's access even if the test only read a summary). Lower C/I/A only when the
   packet shows an actual limit on the primitive (sandboxing, an allowlist, read-only access, a narrow data scope).
-  Do not score impact the packet gives no basis for. Pick AV/PR/UI from what the test actually required; pick S:C
+  Do not score impact the packet gives no basis for. Pick AV/PR/UI from what the test actually required. Use PR:N
+  only when the packet affirmatively shows no account is needed (a public artifact, a request stated to be
+  unauthenticated, or a forged or absent credential that was accepted). A capture that simply shows no credential
+  header is not that proof, because captures can omit or rewrite headers: use PR:L and say in cvss_rationale that
+  the credential requirement was not shown. PR is the ATTACKER's privilege: when the attack is delivered through a
+  victim's action (a crafted link, a malicious page), the victim's account belongs in UI:R, not in PR, and the test
+  account used to play the victim does not make it PR:L. Pick S:C
   only when the impact lands outside the vulnerable component's security authority. The demonstrated-vs-reachable
   distinction belongs in business_impact, not in a lowered vector.
-- business_impact: 2-3 plain-language sentences for an executive at a fleet-management company: who could do what,
-  to whose data or vehicles, and why it matters. No jargon. Separate what was DEMONSTRATED from what the packet shows
-  is REACHABLE (e.g. "the test read a planted canary file; the same access reaches customer exports stored on that
-  host"). Never claim access to data or systems the packet does not mention.
-- recommended_fix: concrete, specific to the code/config shown; primary fix first, then defence in depth; include
-  how to verify the fix.
+- client_title: a noun phrase of at most 12 words naming the flaw and the affected function (e.g. "SQL injection in
+  vehicle lookup endpoint"). Not a sentence, no consequence clause, no host name.
+- business_impact: 2-3 plain-language sentences for a non-technical executive: who could do what, to whose data or
+  systems, and why it matters. No jargon. Name the attacker by the access the vector requires (PR:N "anyone who can
+  reach ...", PR:L "any signed-in user ...", PR:H "an administrator ..."). Separate what was DEMONSTRATED from what
+  the packet shows is REACHABLE (e.g. "the test read a planted canary file; the same access reaches customer exports
+  stored on that host"). Use the packet's own words for data and scopes (say "customers and payment intents", not
+  "billing records"). Never claim access to data, systems, follow-on movement, downtime, legal, contractual or
+  regulatory consequences the packet does not mention. If the packet says an effect was blocked (e.g. by a safety
+  interlock) or not attempted, say so rather than implying it happened. Describe the test as a test, never as a
+  real-world event. Four rules that are easy to break:
+  * Name a consequence only if the packet names it. No generic follow-ons the packet does not state (phishing,
+    data theft, "customer data", altered reports); "report-source exports" stays "report-source exports".
+  * Something stated only in an owner comment, ticket thread or claimed control is attributed ("the owner states
+    ..."), never presented as established, and never the basis for how far the access reaches.
+  * If PR:L was chosen only because the credential requirement was not shown, say that ("an attacker who can reach
+    the search page; whether an account is needed was not shown"), not "any signed-in user".
+  * Scope the attacker exactly as the packet does ("callers from the three namespaces the network policy permits",
+    not "anyone on the network") and never hedge the vector ("an account, if one is required").
+  * Not attempted means not tested: "no outbound callback was used" is not "the test showed no outbound traffic".
+  * Never fill in how a result was obtained when the packet does not say ("the state was recovered", not "the
+    state was recovered from job IDs"), and attribute to the owner only what an owner comment actually says.
+- recommended_fix: concrete, specific to the code/config shown; primary fix first, then defense in depth; end with
+  one sentence that starts "To verify," describing how to confirm the fix.
+- Use US English spelling (organization, behavior, defense, authorized).
 """.format(
     min_conf=MIN_DECISIVE_CONFIDENCE, min_cites=MIN_CITATIONS_CONFIRMED, min_chars=MIN_QUOTE_CHARS,
     metadata=", ".join(sorted(METADATA_FIELDS)), runtime=", ".join(sorted(RUNTIME_FIELDS)))
-_COMMON_RULES = _COMMON_RULES_TEMPLATE
 
 CLASSIFIER_SYSTEM = (
     "You are a senior application-security adjudicator triaging one raw scanner finding for the client. "
@@ -1398,7 +1854,7 @@ def verify_citations(row: Dict[str, str], citations: List[dict]) -> Tuple[List[d
 def verify_checklist(row: Dict[str, str], checklist: List[dict]) -> List[dict]:
     """One entry per rubric check, in rubric order. A yes or no only counts as `backed` when its quote is found
     verbatim in the row; a missing or repeated check id is treated as unknown."""
-    rubric = rubric_for(row.get("category", ""))
+    rubric = rubric_for(row.get("category") or row.get("finding_title", ""))
     if not rubric:
         return []
     given: Dict[str, dict] = {}
@@ -1459,8 +1915,8 @@ def apply_gates(row: Dict[str, str], assessment: dict, extra_citations: List[dic
     cls = a.get("classification")
     conf = float(a.get("confidence", 0.0))
     cited = {v["field"] for v in verified}
-    has_runtime = bool(cited & RUNTIME_FIELDS)
-    has_capture = bool(cited & (RUNTIME_FIELDS - NARRATIVE_RUNTIME_FIELDS))  # request, response, exchange, log or trace
+    has_runtime = any(is_runtime(f) for f in cited)
+    has_capture = any(is_capture(f) for f in cited)  # request, response, exchange, log, trace or tool output
     facts = extract_facts(row)
     reasons: List[str] = []
 
@@ -1478,7 +1934,7 @@ def apply_gates(row: Dict[str, str], assessment: dict, extra_citations: List[dic
     elif cls == "False Positive":
         if not a.get("boundary_observed"):
             reasons.append("the evidence does not show the control actually blocking the attack")
-        if not (cited - CLAIM_FIELDS):
+        if all(is_claim(f) for f in cited):
             reasons.append("the case for dismissal rests only on owner or ticket statements")
         if (facts.get("release_bot_image_differs_from_source") or facts.get("source_revision_matches_manifest") is False) \
                 and not has_runtime:
@@ -1487,7 +1943,7 @@ def apply_gates(row: Dict[str, str], assessment: dict, extra_citations: List[dic
     elif cls != "Needs Review":
         reasons.append(f"unknown classification {cls!r}")
     checks = verify_checklist(row, a.get("checklist", []))
-    why = checklist_reason(row.get("category", ""), cls, checks)
+    why = checklist_reason(row.get("category") or "this type of", cls, checks)
     if why:
         reasons.append(why)
     if cls in ("Confirmed", "False Positive") and conf < MIN_DECISIVE_CONFIDENCE:
@@ -1526,7 +1982,7 @@ def priority(score: Optional[float], environment: str) -> Tuple[Optional[float],
     """
     if score is None:
         return None, ""
-    p = round(score * ENV_WEIGHT.get(environment.strip().lower(), DEFAULT_ENV_WEIGHT), 2)
+    p = round(score * ENV_WEIGHT.get(env_class(environment), DEFAULT_ENV_WEIGHT), 2)
     tier = "CHASE" if p >= TIER_CHASE else "LOOK" if p >= TIER_LOOK else "NOTE"
     return p, tier
 
@@ -1535,11 +1991,49 @@ def _cvss_of(a: dict) -> Tuple[Optional[str], Optional[float], Optional[str]]:
     return score_vector((a.get("report") or {}).get("cvss_vector"))
 
 
+# Severity order of each CVSS 3.1 base metric's values, least severe first.
+METRIC_ORDER = {"AV": "PLAN", "AC": "HL", "PR": "HLN", "UI": "RN", "S": "UC", "C": "NLH", "I": "NLH", "A": "NLH"}
+
+
+def tiebreak_vector(reviews: Sequence[dict]) -> Tuple[Optional[dict], str]:
+    """Combine the CVSS vectors of every review that confirmed the finding, deterministically.
+
+    Each metric takes the median of the reviews' values in severity order; with an even number of reviews the less
+    severe of the two middle values wins, so a higher rating needs agreement and no single review can raise the
+    score alone. The report text (title, rationale, impact, fix) comes from the review whose vector is closest to the
+    result, and one sentence is added naming each metric the reviews scored differently. The outcome does not depend
+    on the order of the reviews.
+
+    Returns:
+        The report to use (None if no review has a valid vector) and the added note ("" when all vectors agree).
+    """
+    scored = [(r, parse_vector(score_vector((r.get("report") or {}).get("cvss_vector"))[0]))
+              for r in reviews if score_vector((r.get("report") or {}).get("cvss_vector"))[0]]
+    if not scored:
+        return None, ""
+    final, split = {}, []
+    for m, order in METRIC_ORDER.items():
+        values = sorted((v[m] for _, v in scored), key=order.index)
+        final[m] = values[(len(values) - 1) // 2]
+        if len(set(values)) > 1:
+            split.append(f"{m} ({' vs '.join(sorted(set(values), key=order.index, reverse=True))}; scored {final[m]})")
+    vector = "CVSS:3.1/" + "/".join(f"{m}:{final[m]}" for m in METRIC_ORDER)
+    # Closest review first; ties broken by the review's own vector text so the choice is order-independent.
+    closest = min(scored, key=lambda rv: (sum(rv[1][m] != final[m] for m in METRIC_ORDER), rv[0]["report"]["cvss_vector"]))[0]
+    report = dict(closest["report"], cvss_vector=vector)
+    note = ""
+    if split:
+        note = ("The reviews scored " + ", ".join(split) + " differently; where they disagree the score uses the middle "
+                "value, or the less severe one when there is no middle, because a higher rating needs agreement.")
+        report["cvss_rationale"] = (report.get("cvss_rationale", "").rstrip() + " " + note).strip()
+    return report, note
+
+
 def needs_adjudication(a: dict, b: dict) -> Optional[str]:
     """Decide whether two reviews of one finding need a third.
 
     Returns:
-        The reason, or None if the reviews agree on the label and, for Confirmed, on severity within CVSS_DIVERGENCE.
+        The reason, or None if the reviews agree on the label and, for Confirmed, on every CVSS metric.
     """
     if a["classification"] != b["classification"]:
         return f"classification: A={a['classification']} vs B={b['classification']}"
@@ -1550,6 +2044,12 @@ def needs_adjudication(a: dict, b: dict) -> Optional[str]:
             return "Confirmed without a valid CVSS vector from both assessors"
         if abs(sa - sb) >= CVSS_DIVERGENCE:
             return f"CVSS divergence: A={sa} vs B={sb}"
+        if cvss_severity_label(sa) != cvss_severity_label(sb):
+            return f"CVSS severity band differs: A={sa} ({cvss_severity_label(sa)}) vs B={sb} ({cvss_severity_label(sb)})"
+        va, vb = parse_vector(_cvss_of(a)[0]), parse_vector(_cvss_of(b)[0])
+        split = [m for m in METRIC_ORDER if va[m] != vb[m]]
+        if split:  # a third vote, so the per-metric median in tiebreak_vector is a real majority
+            return "CVSS metrics differ: " + ", ".join(f"{m} A={va[m]} B={vb[m]}" for m in split)
     return None
 
 
@@ -1559,7 +2059,7 @@ _UNSCORED = {"cvss_vector": None, "cvss_score": None, "cvss_severity": None,
 
 def _base_result(row: Dict[str, str]) -> Dict[str, object]:
     base = {k: row.get(k, "") for k in ("finding_id", "asset", "environment", "finding_title", "category",
-                                        "asset_owner", "scanner_source", "first_observed_utc")}
+                                        "asset_owner", "scanner_source", "first_observed_utc", "last_observed_utc")}
     return base
 
 
@@ -1579,7 +2079,7 @@ def assess_row(row: Dict[str, str], llm: LLMBackend, context: Optional[Dict[str,
     packet = render_packet(row)
     facts_obj = extract_facts(row)
     facts = render_facts({**facts_obj, "dataset_context": context} if context else facts_obj)
-    rubric = render_rubric(row.get("category", ""))
+    rubric = render_rubric(row.get("category") or row.get("finding_title", ""))
     msg = user_message(packet, facts, rubric)
     base = {**_base_result(row), "facts": facts_obj}
     try:
@@ -1607,6 +2107,10 @@ def assess_row(row: Dict[str, str], llm: LLMBackend, context: Optional[Dict[str,
         final["confidence"] = min(float(a["confidence"]), float(b["confidence"]))
         final["boundary_observed"] = bool(a.get("boundary_observed")) and bool(b.get("boundary_observed"))
         final["checklist"] = merge_checklists(row, a.get("checklist", []), b.get("checklist", []))
+        if final["classification"] == "Confirmed":
+            report, _ = tiebreak_vector([a, b])
+            if report:
+                final["report"] = report
         extra = other.get("evidence", [])
         agreement, adjudicated = f"agree ({a['classification']})", False
     else:
@@ -1617,6 +2121,10 @@ def assess_row(row: Dict[str, str], llm: LLMBackend, context: Optional[Dict[str,
             return _failed(base, f"assessors disagreed ({reason}) and adjudication failed: {exc}", A=a, B=b)
         final = dict(c)
         final["confidence"] = min(float(c["confidence"]), ADJUDICATED_CONFIDENCE_CAP)
+        if final["classification"] == "Confirmed":
+            report, _ = tiebreak_vector([x for x in (a, b, c) if x.get("classification") == "Confirmed"])
+            if report:
+                final["report"] = report
         agreement, adjudicated = f"adjudicated [{reason}] -> {c['classification']}", True
 
     gated = apply_gates(row, final, extra)
@@ -1804,12 +2312,36 @@ _PHRASES = [
 _PLAIN_WORDS = {"robust": "strong", "robustly": "firmly", "leverage": "use", "leveraged": "used", "leverages": "uses",
                 "comprehensive": "full", "seamless": "smooth", "seamlessly": "smoothly", "underscores": "shows",
                 "underscore": "show", "delve": "look", "landscape": "environment"}
+# Generated prose is normalised to US spelling (the source data is US English); verbatim evidence is never rewritten.
+_US_SPELLING = {
+    "organisation": "organization", "organisations": "organizations", "organisational": "organizational",
+    "behaviour": "behavior", "behaviours": "behaviors", "defence": "defense", "defences": "defenses",
+    "artefact": "artifact", "artefacts": "artifacts", "honour": "honor", "honoured": "honored", "honours": "honors",
+    "authorise": "authorize", "authorised": "authorized", "authorises": "authorizes", "authorisation": "authorization",
+    "unauthorised": "unauthorized", "parameterise": "parameterize", "parameterised": "parameterized",
+    "sanitise": "sanitize", "sanitised": "sanitized", "sanitisation": "sanitization", "normalise": "normalize",
+    "normalised": "normalized", "serialise": "serialize", "serialised": "serialized", "deserialise": "deserialize",
+    "deserialised": "deserialized", "prioritise": "prioritize", "prioritised": "prioritized", "minimise": "minimize",
+    "recognise": "recognize", "recognised": "recognized", "analyse": "analyze", "analysed": "analyzed",
+    "utilise": "use", "licence": "license", "centre": "center", "catalogue": "catalog", "favour": "favor",
+}
 _FILLER = r"(?:Notably|Importantly|Crucially|Overall|In summary|Ultimately|Additionally|Furthermore|Moreover|It is worth noting that|It's worth noting that|Note that)"
 AI_TELLS = re.compile(
     r"[\u2014\u2013]|\b(?:delve|robust|leverage[sd]?|comprehensive|seamless(?:ly)?|underscores?|landscape|"
     r"notably|importantly|crucially|it'?s worth noting|it is worth noting|in summary|as an ai|language model)\b|"
     r"\b(?:packet|assessor)s?\b|\bfacts block\b|"
     + r"\b(?:" + "|".join(sorted((k for k in FIELD_WORDS if "_" in k), key=len, reverse=True)) + r")\b", re.I)
+
+
+def _capitalise_sentences(t: str) -> str:
+    """Capitalise a lowercase word that starts a sentence ('list. the evidence' -> 'list. The evidence'), but not
+    after abbreviations such as e.g. or i.e., and not code (a word followed by '(', '.' or '_')."""
+    def up(m: "re.Match[str]") -> str:
+        before = t[max(0, m.start() - 6):m.start()].lower()
+        if re.search(r"\b(e\.g|i\.e|etc|vs|approx|no)\.\s*$", before):
+            return m.group(0)
+        return m.group(0)[:-len(m.group(1))] + m.group(1)[:1].upper() + m.group(1)[1:]
+    return re.sub(r"(?<=[a-z0-9)\"'][.!?]) +([a-z]+)(?![(._\w])", up, t)
 
 
 def plain_text(text: str) -> str:
@@ -1821,15 +2353,20 @@ def plain_text(text: str) -> str:
     t = re.sub(r"(?<=\w)\s*\u2013\s*(?=\w)", "-", t)              # en dash between words -> hyphen
     t = re.sub(r"\s*\u2013\s*", ", ", t)
     for pat, rep in _PHRASES:
-        t = re.sub(pat, rep, t, flags=re.I)
+        t = re.sub(pat, lambda m, r=rep: (r[:1].upper() + r[1:]) if m.group(0)[:1].isupper() else r, t, flags=re.I)
     for name in sorted((k for k in FIELD_WORDS if "_" in k), key=len, reverse=True):
         t = re.sub(rf"`?\b{name}\b`?", FIELD_WORDS[name], t)
     t = re.sub(rf"(^|(?<=[.!?]\s)){_FILLER},?\s+(\w)", lambda m: m.group(1) + m.group(2).upper(), t)
     t = re.sub(rf",?\s*\b{_FILLER},\s*", ", ", t, flags=re.I)
     for word, plain in _PLAIN_WORDS.items():
         t = re.sub(rf"\b{word}\b", lambda m, p=plain: p.capitalize() if m.group(0)[0].isupper() else p, t, flags=re.I)
+    t = re.sub(r"\b(" + "|".join(_US_SPELLING) + r")\b",
+               lambda m: (lambda us: us.capitalize() if m.group(0)[0].isupper() else us)(_US_SPELLING[m.group(0).lower()]),
+               t, flags=re.I)
     t = re.sub(r",\s*,", ",", t)
-    t = re.sub(r"\s+([,.;:])", r"\1", t)
+    t = _capitalise_sentences(t)
+    # Drop stray space before punctuation, but not before "../" or "..." (paths and code samples).
+    t = re.sub(r"\s+([,;:]|\.(?![./\w]))", r"\1", t)
     return re.sub(r"[ \t]{2,}", " ", t).strip()
 
 
@@ -1852,11 +2389,32 @@ CLIENT_TEXT_FIELDS = ("reasoning", "missing_evidence", "decisive_boundary", "pro
                       "client_title", "cvss_rationale", "business_impact", "recommended_fix", "adjudication_note")
 
 
+_ACTOR = {"L": "any signed-in user", "H": "a user with administrative privileges"}
+
+
+_PR_ASSUMED = re.compile(r"PR:L[^.]*\b(not shown|was not shown|not stated|does not (show|state)|assum)", re.I)
+
+
+def align_actor(text: str, vector: object, rationale: object = "") -> str:
+    """'Anyone who can reach X' overstates a flaw whose CVSS vector requires an account (PR:L) or admin rights (PR:H);
+    name the attacker the vector describes instead. When PR:L is only an assumption (the rationale says the
+    credential requirement was not shown), the neutral 'an attacker' is used rather than claiming an account."""
+    m = re.search(r"PR:([NLH])", str(vector or ""))
+    who = _ACTOR.get(m.group(1)) if m else None
+    if who and m.group(1) == "L" and _PR_ASSUMED.search(str(rationale or "")):
+        who = "an attacker"
+    if not who or not text:
+        return text
+    return re.sub(r"\b(anyone|anybody|any caller|any client|any attacker|an unauthenticated attacker|an outsider)\b(?= (who|with|that|can|could))",
+                  lambda x: who.capitalize() if x.group(0)[0].isupper() else who, text, flags=re.I)
+
+
 def polish_result(r: Dict[str, object]) -> Dict[str, object]:
     """Clean every client-facing text field of a result in place and return it."""
     for k in CLIENT_TEXT_FIELDS:
         if isinstance(r.get(k), str):
             r[k] = plain_text(r[k])
+    r["business_impact"] = align_actor(r.get("business_impact") or "", r.get("cvss_vector"), r.get("cvss_rationale"))
     for ev in r.get("evidence") or []:
         ev["supports"] = plain_text(ev.get("supports", ""))
     return r
@@ -1984,8 +2542,12 @@ def harmonise(rows: List[Dict[str, str]], results: List[Dict[str, object]]) -> L
             continue
         top = max(votes.values())
         chosen = min((v for v, n in votes.items() if n == top), key=base_score)
+        donor = min((m for m in members if m["cvss_vector"] == chosen), key=lambda m: m["finding_id"])
         for m in members:
             if m["cvss_vector"] != chosen:
+                # The rationale must describe the vector shown, so it comes with the vector.
+                m["cvss_rationale_original"], m["cvss_rationale"] = m.get("cvss_rationale"), donor.get("cvss_rationale")
+                m["business_impact"] = align_actor(m.get("business_impact") or "", chosen, donor.get("cvss_rationale"))
                 changes.append({"finding_id": m["finding_id"], "field": "cvss_vector",
                                 "from": m["cvss_vector"], "to": chosen})
                 m["cvss_vector_original"] = m["cvss_vector"]
@@ -2038,13 +2600,96 @@ def consistency_audit(rows: List[Dict[str, str]], results: List[Dict[str, object
             "minority_rows": sum(len(s["minority"]) for s in splits), "splits": splits}
 
 
+# ---------------------------------------------------------------------------
+# Fact-checker: client-facing claims against the evidence
+# ---------------------------------------------------------------------------
+def factcheck_message(row: Dict[str, str], r: dict, title: str, impact: str) -> str:
+    return (f"<evidence_packet>\n{render_packet(row)}\n</evidence_packet>\n\n"
+            f"<cvss_vector>{r.get('cvss_vector') or ''}</cvss_vector>\n"
+            f"<client_title>{title}</client_title>\n<business_impact>{impact}</business_impact>\n"
+            f"<recommended_fix>{r.get('recommended_fix') or ''}</recommended_fix>")
+
+
+# Record facts a claim may rest on besides the evidence ("on the production service"). The scanner's own severity,
+# confidence and rule are opinions, not facts, and stay excluded.
+RECORD_FIELDS = ("asset", "environment", "asset_owner", "category", "first_observed_utc", "last_observed_utc")
+
+
+def _in_record(row: Dict[str, str], quote: str) -> bool:
+    q = normalise(quote)
+    return bool(q) and any(q in normalise(row.get(f) or "") for f in RECORD_FIELDS)
+
+
+def _strip_markup(quote: str) -> str:
+    """Quotes copied from the packet sometimes carry its <field name="..."> wrapper; the value is what counts."""
+    return re.sub(r"</?field\b[^>]*>", " ", quote or "").strip()
+
+
+def verify_claims(row: Dict[str, str], claims: List[dict]) -> List[dict]:
+    """Code check on the Fact-checker: a claim marked supported must quote text that is really in the row, either
+    in the evidence or in the row's record fields. A missing or invented quote turns the claim into unsupported."""
+    out = []
+    for c in claims:
+        c = dict(c)
+        q = _strip_markup(c.get("quote", ""))
+        if c["status"] == "supported" and not (locate_quote(row, q) or _in_record(row, q)):
+            c["status"], c["note"] = "unsupported", ("quoted text not found in the evidence; " + c.get("note", "")).strip("; ")
+        out.append(c)
+    return out
+
+
+def _unsupported(claims: List[dict], fields: Sequence[str] = ("client_title", "business_impact")) -> List[dict]:
+    return [c for c in claims if c["status"] == "unsupported" and c["field"] in fields]
+
+
+def fact_check(results: List[dict], rows: Dict[str, Dict[str, str]], llm: LLMBackend) -> List[dict]:
+    """Check the text the client will read for every confirmed issue, written from the issue's lead finding.
+
+    Unsupported claims in the title or impact get one rewrite, which is checked again. Text that still carries an
+    unsupported claim is kept but flagged, so a person fixes it before the report goes out. A failed call is also
+    flagged; nothing is ever passed unchecked. Unsupported statements inside the fix are reported, not rewritten.
+
+    Returns:
+        One record per issue: finding_id, status (passed, revised, flagged) and the claims.
+    """
+    log = []
+    for group in issue_groups([r for r in results if r["classification"] == "Confirmed"]):
+        lead = group[0]
+        row = rows.get(lead["finding_id"])
+        if row is None:
+            continue
+        title, impact = lead.get("client_title") or "", lead.get("business_impact") or ""
+        record = {"finding_id": lead["finding_id"], "issue": display_title(lead), "status": "passed",
+                  "original": {"client_title": title, "business_impact": impact}}
+        try:
+            first = llm.complete("factcheck", FACTCHECK_SYSTEM, FACTCHECK_SCHEMA, factcheck_message(row, lead, title, impact))
+            claims = verify_claims(row, first["claims"])
+            if _unsupported(claims):
+                title = plain_text(first["revised_title"]) or title
+                impact = align_actor(plain_text(first["revised_impact"]) or impact, lead.get("cvss_vector"), lead.get("cvss_rationale"))
+                second = llm.complete("factcheck", FACTCHECK_SYSTEM, FACTCHECK_SCHEMA, factcheck_message(row, lead, title, impact))
+                record["first_pass"] = claims
+                claims = verify_claims(row, second["claims"])
+                record["status"] = "flagged" if _unsupported(claims) else "revised"
+                lead["client_title"], lead["business_impact"] = title, impact
+        except LLMError as exc:
+            claims, record["status"], record["error"] = [], "flagged", f"fact check failed: {exc}"
+        record["claims"] = claims
+        record["fix_unsupported"] = [c["claim"] for c in _unsupported(claims, ("recommended_fix",))]
+        lead["fact_check"] = {k: record[k] for k in ("status", "claims", "fix_unsupported") if k in record}
+        if record.get("error"):
+            lead["fact_check"]["error"] = record["error"]
+        log.append(record)
+    return log
+
+
 # ============================================================================
 # Client HTML report
 # ============================================================================
 # Client-ready, self-contained HTML report (no external assets).
 SEV_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "None": 4}
 FIELD_LABELS = {
-    "observation": "Analyst observation", "validation_attempt": "Validation test", "raw_request": "HTTP request",
+    "observation": "Source observation", "validation_attempt": "Validation test", "raw_request": "HTTP request",
     "raw_response": "HTTP response", "raw_http_exchange": "HTTP exchange", "mixed_service_logs": "Service logs",
     "distributed_trace_excerpt": "Distributed trace", "source_code_excerpt": "Source code",
     "code_or_config_context": "Code / config", "deployment_manifest_excerpt": "Deployment manifest",
@@ -2053,6 +2698,14 @@ FIELD_LABELS = {
     "ticket_comment_thread": "Ticket thread", "evidence_gaps": "Evidence gaps",
     "evidence_collection_warnings": "Collection warnings",
 }
+
+
+def field_label(f: str) -> str:
+    """Human label for a pipeline key: 'capture.plugin_output' -> 'Plugin output'."""
+    if f in FIELD_LABELS:
+        return FIELD_LABELS[f]
+    name = _KIND_PREFIX.sub("", f).replace("_", " ").strip()
+    return (name[:1].upper() + name[1:]) or f
 
 
 def e(x: object) -> str:
@@ -2064,9 +2717,10 @@ def e(x: object) -> str:
 # set as code, the way a consultant formats them in a written report.
 _CODE_TOKEN = re.compile(
     r"https?://[^\s<>\"']+[^\s<>\"'.,;:)]"
-    r"|(?<![\w/])/(?:[\w.~%-]+/)+[\w.~%-]*(?:\?[^\s<>\"']*[^\s<>\"'.,;:)])?"
+    r"|(?<![\w/.])(?:(?:\.\./)+|/)(?:[\w.~%-]+/)+(?:[\w.~%-]*[\w~%-])?(?:\?[^\s<>\"']*[^\s<>\"'.,;:)])?"
     r"|\b[\w/]+\.(?:py|yaml|yml|json|txt)\b"
     r"|\b[A-Za-z_][\w.]*\([^()\s]{0,40}\)"
+    r"|\b[A-Za-z_]\w*(?:\.\w+)*\.\w*_\w*\b"
     r"|\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b")
 
 
@@ -2090,18 +2744,6 @@ def _plural(n: int, one: str, many: str) -> str:
     return f"{n} {one if n == 1 else many}"
 
 
-def _raised_by(r: dict) -> str:
-    return r.get("scanner_source") or "unknown scanner"
-
-
-def _agreement_text(r: dict) -> str:
-    if r.get("error"):
-        return "automated assessment failed"
-    if r.get("adjudicated"):
-        return "the two independent reviews disagreed; a third review decided"
-    return "two independent assessments agreed"
-
-
 def _cls_badge(c: str) -> str:
     slug = {"Confirmed": "conf", "False Positive": "fp", "Needs Review": "nr"}.get(c, "nr")
     return f'<span class="cls cls-{slug}">{e(c)}</span>'
@@ -2113,14 +2755,6 @@ def _priority_key(r: dict) -> tuple:
 
 def _title_key(r: dict) -> tuple:
     return (r["finding_title"], r["finding_id"])
-
-
-def _group_by_title(rows: List[dict], key: Callable[[dict], Any]) -> Dict[str, List[dict]]:
-    """Group rows by finding title; groups and members follow `key` order."""
-    groups: Dict[str, List[dict]] = {}
-    for r in sorted(rows, key=key):
-        groups.setdefault(r["finding_title"], []).append(r)
-    return groups
 
 
 # ---------------------------------------------------------------------------
@@ -2142,6 +2776,43 @@ ISSUE_LABEL = {
     "debug_exposure": "Debug console exposed", "cross_tenant_command": "Vehicle commands across customers",
     "cross_tenant_report": "Reports readable across customers",
 }
+# Standard weakness references per issue type: CWE IDs, and the OWASP Top 10 (2021) category only where that
+# category's published CWE mapping contains the CWE.
+ISSUE_REFS = {
+    "secret_exposure": (("CWE-540", "Inclusion of Sensitive Information in Source Code"), ("CWE-798", "Use of Hard-coded Credentials")),
+    "shell_injection": (("CWE-78", "OS Command Injection"),),
+    "code_execution": (("CWE-95", "Eval Injection"),),
+    "sql_injection": (("CWE-89", "SQL Injection"),),
+    "token_forgery": (("CWE-347", "Improper Verification of Cryptographic Signature"),),
+    "cross_tenant_command": (("CWE-639", "Authorization Bypass Through User-Controlled Key"),),
+    "cross_tenant_report": (("CWE-639", "Authorization Bypass Through User-Controlled Key"),),
+    "path_traversal": (("CWE-22", "Path Traversal"),),
+    "archive_write": (("CWE-22", "Path Traversal"),),
+    "reset_token": (("CWE-640", "Weak Password Recovery Mechanism for Forgotten Password"), ("CWE-330", "Use of Insufficiently Random Values")),
+    "cors_credentialed": (("CWE-942", "Permissive Cross-domain Policy with Untrusted Domains"),),
+    "oauth_redirect": (("CWE-601", "URL Redirection to Untrusted Site (Open Redirect)"),),
+    "enumeration": (("CWE-204", "Observable Response Discrepancy"),),
+    "ssrf": (("CWE-918", "Server-Side Request Forgery"),),
+    "debug_exposure": (("CWE-489", "Active Debug Code"), ("CWE-215", "Insertion of Sensitive Information Into Debugging Code")),
+}
+OWASP_2021 = {
+    "CWE-540": "A01:2021 Broken Access Control", "CWE-22": "A01:2021 Broken Access Control",
+    "CWE-639": "A01:2021 Broken Access Control", "CWE-601": "A01:2021 Broken Access Control",
+    "CWE-347": "A02:2021 Cryptographic Failures", "CWE-330": "A02:2021 Cryptographic Failures",
+    "CWE-78": "A03:2021 Injection", "CWE-89": "A03:2021 Injection", "CWE-95": "A03:2021 Injection",
+    "CWE-942": "A05:2021 Security Misconfiguration", "CWE-798": "A07:2021 Identification and Authentication Failures",
+    "CWE-640": "A07:2021 Identification and Authentication Failures", "CWE-918": "A10:2021 Server-Side Request Forgery",
+}
+
+
+def references_html(key: str) -> str:
+    """CWE links (and OWASP Top 10 categories) for an issue type; empty when the type has no mapping."""
+    refs = ISSUE_REFS.get(key, ())
+    items = [f"<a href='https://cwe.mitre.org/data/definitions/{cwe.split('-')[1]}.html'>{e(cwe)}</a> {e(name)}" for cwe, name in refs]
+    owasp = sorted({OWASP_2021[c] for c, _ in refs if c in OWASP_2021})
+    return "; ".join(items) + (f". OWASP Top 10: {e(', '.join(owasp))}" if owasp else "")
+
+
 CVSS_METRICS = {
     "AV": ("Attack vector", {"N": "Network", "A": "Adjacent network", "L": "Local", "P": "Physical"}),
     "AC": ("Complexity", {"L": "Low", "H": "High"}),
@@ -2155,27 +2826,86 @@ CVSS_METRICS = {
 
 
 def issue_key(r: dict) -> str:
-    """Group key for the same flaw wherever it occurs: its attack step, else its category."""
-    return chain_step(r) or "other:" + str(r.get("category") or "uncategorised")
+    """Attack-step type of a finding (e.g. sql_injection), else its category. Used for chains and labels."""
+    return chain_step(r) or "other:" + str(r.get("category") or "uncategorized")
+
+
+def flaw_key(r: dict) -> Tuple[str, str]:
+    """One report section per distinct flaw: same attack-step type and same scanner finding title.
+    Two SQL injections (a read-only lookup and an UPDATE identifier injection) share a type but not a title,
+    endpoint, code or fix, so they stay separate."""
+    return issue_key(r), r.get("finding_title") or ""
+
+
+def flaw_anchor(key: Tuple[str, str]) -> str:
+    return "issue-" + re.sub(r"[^a-z0-9]+", "-", f"{key[0]} {key[1]}".lower()).strip("-")
+
+
+def issue_groups(confirmed: List[dict]) -> List[List[dict]]:
+    """Confirmed findings grouped by flaw, each group led by its highest-priority finding. Groups are ordered by
+    severity, then score, then production exposure, then reach, so both reports number the issues identically."""
+    groups: Dict[Tuple[str, str], List[dict]] = {}
+    for r in sorted(confirmed, key=_priority_key):
+        groups.setdefault(flaw_key(r), []).append(r)
+
+    def order(rows: List[dict]) -> tuple:
+        lead = rows[0]
+        return (SEV_ORDER.get(lead.get("cvss_severity"), 5), -(lead.get("cvss_score") or 0),
+                -sum(1 for r in rows if _is_prod(r)), -len(rows), lead["finding_id"])
+    return sorted(groups.values(), key=order)
+
+
+def _is_prod(r: dict) -> bool:
+    return env_class(r["environment"]) == "production"
+
+
+def _systems(rows: List[dict]) -> int:
+    """Distinct systems (host and environment) behind a set of findings. Several findings can be on one system."""
+    return len({(r["asset"], r["environment"].strip().lower()) for r in rows})
+
+
+def _reach(rows: List[dict]) -> str:
+    """'7 findings on 3 systems' - findings and systems are different counts and both are stated."""
+    return f"{_plural(len(rows), 'finding', 'findings')} on {_plural(_systems(rows), 'system', 'systems')}"
 
 
 _TITLE_HOST = re.compile(r"\s+on\s+[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:example|internal)\b|\s+in production\b", re.I)
 
 
-def _date_window(days: List[str], default: str = "the observation period") -> str:
-    """'July 1, 2026 to October 11, 2026' from ISO dates; unparseable values are skipped."""
+def _fmt_date(d: dt.date) -> str:
+    return d.strftime("%B %d, %Y").replace(" 0", " ")
+
+
+def _dates(days: List[str]) -> List[dt.date]:
     good = []
     for d in days:
         try:
-            good.append(dt.date.fromisoformat(d[:10]))
+            good.append(dt.date.fromisoformat((d or "")[:10]))
         except ValueError:
             continue
-    if not good:
-        return default
-    def fmt(d: dt.date) -> str:
-        return d.strftime("%B %d, %Y").replace(" 0", " ")
+    return good
 
-    return f"{fmt(min(good))} to {fmt(max(good))}"
+
+def _date_window(days: List[str], default: str = "the observation period") -> str:
+    """'July 1, 2026 to October 11, 2026' from ISO dates; unparseable values are skipped."""
+    good = _dates(days)
+    return f"{_fmt_date(min(good))} to {_fmt_date(max(good))}" if good else default
+
+
+def _observed(rows: List[dict], today: Optional[dt.date] = None) -> Tuple[str, str]:
+    """The span the scanner observed these findings (first to last observation), and a note when the source
+    timestamps run past the report date. Timestamps are reported as recorded, never corrected."""
+    days = [r.get(k) or "" for r in rows for k in ("first_observed_utc", "last_observed_utc")]
+    good, today = _dates(days), today or dt.date.today()
+    late = sum(1 for r in rows if any(d > today for d in _dates([r.get("first_observed_utc") or "", r.get("last_observed_utc") or ""])))
+    note = (f"{_plural(late, 'finding has', 'findings have')} source timestamps later than the report date "
+            f"({_fmt_date(today)}); dates are reported as recorded in the source data.") if late else ""
+    return (_date_window(days) if good else ""), note
+
+
+def _observed_from(window: str) -> str:
+    """', observed from July 1, 2026 to ...', or nothing when the source data records no dates."""
+    return f", observed from {window}" if window else ""
 
 
 def display_title(r: dict) -> str:
@@ -2207,7 +2937,8 @@ def _sentences(text: object) -> List[str]:
 
 _HARDEN = re.compile(r"^(as (further |additional )?(defence|defense|protection)|for (extra )?defence|"
                      r"as defence|alternatively|also,? (add|limit|run|move|turn))", re.I)
-_VERIFY = re.compile(r"^(to verify|verify|to confirm|confirm that|check that)", re.I)
+# "Verify every token against the issuer key" is a fix step, not a retest, so bare "Verify" does not start verification.
+_VERIFY = re.compile(r"^(to verify|verify (by|the fix|that the fix)|to confirm|confirm that|check that|retest)", re.I)
 
 
 def split_fix(text: object) -> Tuple[List[str], List[str], List[str]]:
@@ -2232,12 +2963,6 @@ def _trim(s: object, n: int = 240) -> str:
     return s if len(s) <= n else s[: n - 1].rstrip() + "..."
 
 
-def _sev_of(score: Optional[float]) -> str:
-    if score is None:
-        return "None"
-    return "Critical" if score >= 9 else "High" if score >= 7 else "Medium" if score >= 4 else "Low" if score > 0 else "None"
-
-
 def _worst(rows: List[dict]) -> dict:
     return min(rows, key=lambda r: (SEV_ORDER.get(r.get("cvss_severity"), 5), -(r.get("cvss_score") or 0)))
 
@@ -2258,14 +2983,6 @@ def _donut(parts: List[Tuple[str, int, str]], center: str, sub: str) -> str:
             f"<text x='80' y='96' text-anchor='middle' class='ds'>{e(sub)}</text></svg><ul class='legend'>{legend}</ul></div>")
 
 
-def _stack_bar(parts: List[Tuple[str, int, str]]) -> str:
-    total = sum(n for _, n, _ in parts) or 1
-    segs = "".join(f"<span style='width:{100 * n / total:.2f}%;background:{col}' title='{e(lab)}: {n}'>{n if n / total > .06 else ''}</span>"
-                   for lab, n, col in parts if n)
-    legend = "".join(f"<li><i style='background:{col}'></i>{e(lab)} <b>{n}</b></li>" for lab, n, col in parts)
-    return f"<div class='stack'>{segs}</div><ul class='legend row'>{legend}</ul>"
-
-
 def _bar_rows(items: List[Tuple[str, int, str, str]], scale: int) -> str:
     """items: (label, value, color, href). Horizontal bars, one per row."""
     scale = scale or 1
@@ -2273,7 +2990,7 @@ def _bar_rows(items: List[Tuple[str, int, str, str]], scale: int) -> str:
     for label, n, color, href in items:
         name = f"<a href='{e(href)}'>{e(label)}</a>" if href else e(label)
         rows.append(f"<div class='brow'><span class='bl'>{name}</span><span class='bt'><span class='bf' "
-                    f"style='width:{max(100 * n / scale, 2):.1f}%;background:{color}'></span></span><b class='bv'>{n}</b></div>")
+                    f"style='width:{(max(100 * n / scale, 2) if n else 0):.1f}%;background:{color}'></span></span><b class='bv'>{n}</b></div>")
     return "<div class='bars'>" + "".join(rows) + "</div>"
 
 
@@ -2294,15 +3011,6 @@ def _heatmap(confirmed: List[dict]) -> str:
         tot = sum(cnt[(env, s)] for s in sevs)
         body.append(f"<tr><th scope='row'>{e(env)}</th>{''.join(cells)}<td class='tot'>{tot}</td></tr>")
     return f"<table class='heat'><thead><tr><th></th>{head}</tr></thead><tbody>{''.join(body)}</tbody></table>"
-
-
-def _score_meter(score: Optional[float]) -> str:
-    if score is None:
-        return ""
-    pos = max(0.0, min(float(score), 10.0)) * 10
-    return (f"<div class='meter' role='img' aria-label='CVSS score {e(score)} out of 10'><span class='ms'></span>"
-            f"<span class='mk' style='left:{pos:.1f}%'><b>{e(score)}</b></span></div>"
-            f"<div class='mlab'><span>0</span><span>Low</span><span>Medium</span><span>High</span><span>Critical</span><span>10</span></div>")
 
 
 def _cvss_chips(vector: object) -> str:
@@ -2332,13 +3040,13 @@ def _evidence_points(ev: List[dict], limit: int = 4) -> str:
         return "<p class='muted'>No verifiable citations.</p>"
     items = []
     for c in ev[:limit]:
-        items.append(f"<li><b>{prose(c.get('supports', ''))}</b><span class='src'>{e(FIELD_LABELS.get(c['field'], c['field']))}</span>"
+        items.append(f"<li><b>{prose(c.get('supports', ''))}</b><span class='src'>{e(field_label(c['field']))}</span>"
                      f"<code class='quote'>{e(_trim(c['quote'], 300))}</code></li>")
     more = ""
     if len(ev) > limit:
         more = ("<details class='more'><summary>" + f"{len(ev) - limit} more evidence item{'s' if len(ev) - limit != 1 else ''}</summary>"
                 "<ul class='proof'>" + "".join(
-                    f"<li><b>{prose(c.get('supports', ''))}</b><span class='src'>{e(FIELD_LABELS.get(c['field'], c['field']))}</span>"
+                    f"<li><b>{prose(c.get('supports', ''))}</b><span class='src'>{e(field_label(c['field']))}</span>"
                     f"<code class='quote'>{e(_trim(c['quote'], 300))}</code></li>" for c in ev[limit:]) + "</ul></details>")
     return f"<ul class='proof'>{''.join(items)}</ul>{more}"
 
@@ -2349,119 +3057,6 @@ def _impact_block(text: object) -> str:
         return ""
     lead, rest = sents[0], " ".join(sents[1:])
     return f"<p class='lead'>{prose(lead)}</p>" + (f"<p>{prose(rest)}</p>" if rest else "")
-
-
-def _fix_block(text: object) -> str:
-    steps, harden, verify = split_fix(text)
-    out = ""
-    if steps:
-        out += "<h5>What to change</h5><ol class='steps'>" + "".join(f"<li>{prose(s)}</li>" for s in steps) + "</ol>"
-    if harden:
-        out += "<h5>Extra hardening</h5>" + _list(harden)
-    if verify:
-        out += "<h5>How to check the fix worked</h5>" + _list(verify)
-    return out
-
-
-def _technical_details(r: dict) -> str:
-    return f"""<details class="tech"><summary>Technical details: scoring, provenance and controls</summary>
-    <p><strong>Finding ID.</strong> {e(r['finding_id'])} &middot; raised by {e(r.get('scanner_source') or 'unknown scanner')} &middot; first observed {e((r.get('first_observed_utc') or '')[:10])} &middot; asset owner: {e(r.get('asset_owner'))}</p>
-    <p><strong>CVSS 3.1 vector.</strong> <code>{e(r.get('cvss_vector') or 'unscored')}</code></p>
-    <p><strong>Why this score.</strong> {prose(r.get('cvss_rationale'))}</p>
-    <p><strong>What the evidence shows.</strong> {prose(r.get('reasoning'))}</p>
-    <p><strong>Which code revision was running.</strong> {prose(r.get('provenance'))}</p>
-    <p><strong>Claimed protections.</strong> {prose(r.get('compensating_controls'))}</p>
-    <p><strong>Assessment confidence.</strong> {e(r['confidence'])} &middot; {e(_agreement_text(r))}</p>
-  </details>"""
-
-
-def _hero_card(r: dict, anchor: str, rank: int, siblings: int) -> str:
-    sev = r.get("cvss_severity") or "None"
-    same = (f"<p class='note'>The same issue was also confirmed on {siblings} other asset{'s' if siblings != 1 else ''}. "
-            f"See <a href='#issue-{e(issue_key(r))}'>all instances</a>.</p>") if siblings else ""
-    chains = (f"<p class='note'>Part of an attack chain: {e(', '.join(sorted({c.split(':')[0].replace('-', ' ') for c in r['chains']})))}. <a href='#chains'>See chains</a>.</p>"
-              if r.get("chains") else "")
-    return f"""
-<article class="hero sev-b-{e(sev.lower())}" id="{e(anchor)}">
-  <div class="hero-top">
-    <div class="rank">{rank}</div>
-    <div class="hero-title"><div class="eyebrow">{e(r.get('category'))} &middot; {e(r['finding_id'])}</div>
-      <h3>{e(display_title(r))}</h3>
-      <div class="where"><span class="env env-{e(r['environment'].strip().lower())}">{e(r['environment'])}</span> <code>{e(r['asset'])}</code>
-        {_tier_badge(r.get('priority_tier'))}</div></div>
-    <div class="hero-score">{_sev_badge(sev)}<div class="big">{e(r.get('cvss_score') if r.get('cvss_score') is not None else '-')}</div><div class="muted">CVSS 3.1</div></div>
-  </div>
-  {_score_meter(r.get('cvss_score'))}
-  <div class="cols">
-    <section><h4>What we found and why it matters</h4>{_impact_block(r.get('business_impact'))}{same}{chains}</section>
-    <section><h4>How we know</h4>{_evidence_points(r.get('evidence', []))}</section>
-  </div>
-  <section class="fixbox"><h4>How to fix it</h4>{_fix_block(r.get('recommended_fix'))}</section>
-  <h4>Severity breakdown</h4>{_cvss_chips(r.get('cvss_vector'))}
-  {_technical_details(r)}
-</article>"""
-
-
-def _instance_detail(r: dict) -> str:
-    return (f"<details class='inst-d' id='f-{e(r['finding_id'])}'><summary>Evidence for {e(r['finding_id'])} "
-            f"<span class='muted'>{e(r['asset'])} ({e(r['environment'])})</span></summary>"
-            f"{_evidence_points(r.get('evidence', []), 3)}{_technical_details(r)}</details>")
-
-
-def _issue_block(i: int, key: str, rows: List[dict]) -> str:
-    lead = rows[0]
-    worst = _worst(rows)
-    label = issue_label(key, lead)
-    prod = sum(1 for r in rows if r["environment"].strip().lower() == "production")
-    inst_rows = "".join(
-        f"<tr><td><a href='#f-{e(r['finding_id'])}'>{e(r['finding_id'])}</a></td><td><code>{e(r['asset'])}</code></td>"
-        f"<td><span class='env env-{e(r['environment'].strip().lower())}'>{e(r['environment'])}</span></td>"
-        f"<td>{_sev_badge(r.get('cvss_severity'))} {e(r.get('cvss_score'))}</td><td>{_tier_badge(r.get('priority_tier'))}</td>"
-        f"<td>{e(r['confidence'])}</td></tr>" for r in rows)
-    sents = _sentences(lead.get("business_impact"))
-    return f"""
-<details class="issue" id="issue-{e(key)}">
-  <summary><span class="inum">{i}</span>
-    <span class="it"><b>{e(label)}</b><small>{prose(sents[0]) if sents else ''}</small></span>
-    <span class="ic"><b>{len(rows)}</b><small>instance{'s' if len(rows) != 1 else ''}</small></span>
-    <span class="iw">{_env_chips(rows)}{f"<small>{prod} in production</small>" if prod else ""}</span>
-    <span class="is">{_sev_badge(worst.get('cvss_severity'))}<small>up to {e(worst.get('cvss_score'))}</small></span></summary>
-  <div class="issue-body">
-    <div class="cols"><section><h4>Impact</h4>{_impact_block(lead.get('business_impact'))}</section>
-      <section class="fixbox"><h4>Recommended fix</h4>{_fix_block(lead.get('recommended_fix'))}</section></div>
-    <h4>Where it was confirmed</h4>
-    <div class="tablewrap"><table class="inst"><thead><tr><th>ID</th><th>Asset</th><th>Environment</th><th>Severity</th><th>Priority</th><th>Confidence</th></tr></thead><tbody>{inst_rows}</tbody></table></div>
-    {''.join(_instance_detail(r) for r in rows)}
-  </div>
-</details>"""
-
-
-def _chains_html(chains: List[dict]) -> str:
-    if not chains:
-        return "<p class='muted'>No combination of confirmed findings in a single environment forms a known attack progression.</p>"
-    order = sorted(chains, key=lambda c: (c["status"] != "confirmed", c["environment"] != "production", c["chain_id"]))
-    cards = []
-    for c in order:
-        boxes = []
-        for st in c["stages"]:
-            fs = st["findings"]
-            ids = ", ".join(f["finding_id"] for f in fs[:5]) + (f" +{len(fs) - 5} more" if len(fs) > 5 else "")
-            titles = sorted({f["title"] for f in fs})
-            blurb = _trim(titles[0], 70) + (f" (+{len(titles) - 1} related)" if len(titles) > 1 else "")
-            scores = [f["cvss_score"] for f in fs if f.get("cvss_score") is not None]
-            state = "ok" if all(f["classification"] == "Confirmed" for f in fs) else "open"
-            boxes.append(f"<div class='stage stage-{state}'><div class='sl'>{e(st['stage'])}</div>"
-                         f"<div class='sn'>{len(fs)} finding{'s' if len(fs) != 1 else ''}"
-                         f"{' &middot; CVSS up to ' + e(max(scores)) if scores else ''}</div>"
-                         f"<div class='sb'>{e(blurb)}</div><div class='si'>{e(ids)}</div>"
-                         f"<div class='sstate'>{'Confirmed' if state == 'ok' else 'Still under review'}</div></div>")
-        status = ("Every step confirmed" if c["status"] == "confirmed" else
-                  f"Depends on {e(', '.join(c['pending_review'][:6]))}{' and more' if len(c['pending_review']) > 6 else ''}, still under review")
-        cards.append(f"<article class='chain'><header><h3>{e(c['name'])}</h3><span class='env env-{e(c['environment'])}'>{e(c['environment'])}</span>"
-                     f"<span class='tier tier-{'chase' if c['status'] == 'confirmed' else 'look'}'>{status if c['status'] != 'confirmed' else 'All steps confirmed'}</span></header>"
-                     f"<div class='flow'>{'<span class=arrow>&rarr;</span>'.join(boxes)}</div>"
-                     f"<p class='muted'>{e(c['why'])}</p></article>")
-    return "".join(cards)
 
 
 def _needs_review_html(nr: List[dict]) -> str:
@@ -2485,10 +3080,10 @@ def _needs_review_html(nr: List[dict]) -> str:
 # ---------------------------------------------------------------------------
 SEV_DISPLAY = {"Medium": "Moderate"}
 SEV_DEFS = [
-    ("Critical", "9.0-10.0", "Exploitation is straightforward and usually results in system-level compromise or exposure across customers. Form a plan of action and fix immediately."),
-    ("High", "7.0-8.9", "Exploitation is more difficult but could cause elevated privileges and potentially a loss of data or downtime. Form a plan of action and fix as soon as possible."),
-    ("Moderate", "4.0-6.9", "Weaknesses exist but are harder to exploit or need extra steps such as user interaction. Fix after high-priority issues are resolved."),
-    ("Low", "0.1-3.9", "Not directly exploitable but would reduce the attack surface. Fix during the next maintenance window."),
+    ("Critical", "9.0-10.0", "CVSS 3.1 Critical. Serious compromise is possible with few preconditions. Form a plan of action and fix immediately."),
+    ("High", "7.0-8.9", "CVSS 3.1 High. A confirmed flaw with significant impact on confidentiality, integrity or availability. Fix as soon as possible."),
+    ("Moderate", "4.0-6.9", "CVSS 3.1 Medium. Impact is limited or exploitation needs extra conditions such as an account or user interaction. Fix after Critical and High issues."),
+    ("Low", "0.1-3.9", "CVSS 3.1 Low. Minor impact. Fix during the next maintenance window."),
     ("Informational", "N/A", "No confirmed vulnerability. Items where the evidence could not decide the question, findings shown to be false alarms, and controls that held up."),
 ]
 _VECTOR_WORDS = {"N": "Remote (network)", "A": "Adjacent (internal network)", "L": "Local", "P": "Physical"}
@@ -2508,16 +3103,20 @@ def _figures(ev: List[dict], counter: List[int], limit: int = 6) -> str:
     for c in ev[:limit]:
         counter[0] += 1
         out.append(f"<figure><pre>{e(_trim(c['quote'], 420))}</pre><figcaption>Figure {counter[0]}: {prose(c.get('supports', ''))} "
-                   f"<span class='src'>({e(FIELD_LABELS.get(c['field'], c['field']))})</span></figcaption></figure>")
+                   f"<span class='src'>({e(field_label(c['field']))})</span></figcaption></figure>")
     return "".join(out)
 
 
-def _remediation(r: dict) -> str:
+def _owners(rows: List[dict]) -> str:
+    return ", ".join(sorted({r.get("asset_owner") for r in rows if r.get("asset_owner")})) or "Asset owner (not recorded)"
+
+
+def _remediation(r: dict, rows: Sequence[dict] = ()) -> str:
     steps, harden, verify = split_fix(r.get("recommended_fix"))
-    items = [(s) for s in steps] + [("Defence in depth: " + s) if not s.lower().startswith(("as ", "for ")) else s for s in harden]
+    items = list(steps) + [("Defense in depth: " + s) if not s.lower().startswith(("as ", "for ")) else s for s in harden]
     li = "".join(f"<li><b>Item {i}:</b> {prose(s)}</li>" for i, s in enumerate(items, 1))
     retest = _list(verify) if verify else ""
-    return (f"<table class='kv'><tr><th>Who:</th><td>{e(r.get('asset_owner') or 'Asset owner')}</td></tr>"
+    return (f"<table class='kv remed'><tr><th>Who:</th><td>{e(_owners(list(rows) or [r]))}</td></tr>"
             f"<tr><th>Vector:</th><td>{e(_vector_word(r.get('cvss_vector')))}</td></tr>"
             f"<tr><th>Action:</th><td><ul class='items'>{li}</ul></td></tr>"
             + (f"<tr><th>Retest:</th><td>{retest}</td></tr>" if retest else "") + "</table>")
@@ -2526,6 +3125,15 @@ def _remediation(r: dict) -> str:
 def _tcm_finding(code: str, anchor: str, title: str, lead: dict, rows: List[dict], counter: List[int],
                  badge: str = "", extra_instances: str = "") -> str:
     sev = lead.get("cvss_severity")
+    refs = references_html(issue_key(lead))
+    tools = ", ".join(sorted({r.get("scanner_source") or "not recorded" for r in rows}))
+    fc = lead.get("fact_check") or {}
+    bad = [c for c in fc.get("claims", []) if c["status"] == "unsupported"]
+    fc_row = (f"<tr><th>Fact check:</th><td><b>{e(fc['status'].capitalize())}</b>"
+              + (f" &middot; {e(fc['error'])}" if fc.get("error") else "")
+              + ("".join(f"<br>Unsupported: {e(c['claim'])} <span class='muted'>({e(c.get('note') or '')})</span>" for c in bad))
+              + ("".join(f"<br>Fix statement not in evidence: {e(x)}" for x in fc.get("fix_unsupported", [])))
+              + "</td></tr>") if fc else ""
     systems = "".join(f"<li><code>{e(r['asset'])}</code> ({e(r['environment'])}) <a href='#f-{e(r['finding_id'])}'>{e(r['finding_id'])}</a></li>" for r in rows)
     impact = _impact_block(lead.get("business_impact"))
     chains = (f"<p class='note'>This finding is part of an attack chain ({e(', '.join(sorted({c.split(':')[0].replace('-', ' ') for c in lead['chains']}))) }). "
@@ -2537,29 +3145,32 @@ def _tcm_finding(code: str, anchor: str, title: str, lead: dict, rows: List[dict
     <tr><th>Description:</th><td>{prose(lead.get('decisive_boundary'))}</td></tr>
     <tr><th>Impact:</th><td><b>{e(SEV_DISPLAY.get(sev, sev or 'Unscored'))}</b> &middot; CVSS 3.1 score {e(lead.get('cvss_score') if lead.get('cvss_score') is not None else 'n/a')} {_tier_badge(lead.get('priority_tier'))}{impact}{chains}</td></tr>
     <tr><th>System{'s' if len(rows) != 1 else ''}:</th><td><ul class="plain">{systems}</ul></td></tr>
-    <tr><th>References:</th><td>CVSS 3.1 vector <code>{e(lead.get('cvss_vector') or 'unscored')}</code>{_cvss_chips(lead.get('cvss_vector'))}
+    <tr><th>Risk:</th><td>CVSS 3.1 vector <code>{e(lead.get('cvss_vector') or 'unscored')}</code>{_cvss_chips(lead.get('cvss_vector'))}
       <p class="muted">{prose(lead.get('cvss_rationale'))}</p></td></tr>
+    <tr><th>Detected by:</th><td>{e(tools)} <span class="muted">(scanner named in the source data)</span></td></tr>
+    {f"<tr><th>References:</th><td>{refs}</td></tr>" if refs else ""}
+    {fc_row}
   </table>
-  <h4>Exploitation Proof of Concept</h4>
+  <h4>Evidence and Analysis (from source records)</h4>
   <p>{prose(lead.get('reasoning'))}</p>
   {_figures(lead.get('evidence', []), counter)}
   <h4>Remediation</h4>
-  {_remediation(lead)}
+  {_remediation(lead, rows)}
   {extra_instances}
 </section>"""
 
 
 def _instances_table(rows: List[dict]) -> str:
     trs = "".join(f"<tr><td><a href='#f-{e(r['finding_id'])}'>{e(r['finding_id'])}</a></td><td><code>{e(r['asset'])}</code></td><td>{e(r['environment'])}</td>"
-                  f"{_sev_cell(r.get('cvss_severity'))}<td>{e(r.get('cvss_score'))}</td><td>{e(TIER_LABEL.get(r.get('priority_tier'), ''))}</td><td>{e(r['confidence'])}</td></tr>"
+                  f"<td>{e(r.get('asset_owner') or '')}</td>{_sev_cell(r.get('cvss_severity'))}<td>{e(r.get('cvss_score'))}</td><td>{e(TIER_LABEL.get(r.get('priority_tier'), ''))}</td><td>{e(r['confidence'])}</td></tr>"
                   for r in rows)
-    return ("<h4>Where this was confirmed</h4><table class='grid'><thead><tr><th>ID</th><th>System</th><th>Environment</th><th>Severity</th><th>CVSS</th><th>Priority</th><th>Confidence</th></tr></thead>"
+    return (f"<h4>Where this was confirmed ({e(_reach(rows))})</h4><table class='grid'><thead><tr><th>ID</th><th>System</th><th>Environment</th><th>Owner</th><th>Severity</th><th>CVSS</th><th>Priority</th><th>Confidence</th></tr></thead>"
             f"<tbody>{trs}</tbody></table>")
 
 
 def _instance_evidence(rows: List[dict], counter: List[int]) -> str:
-    """Per-instance evidence, kept for traceability; shown on screen, left out of print."""
-    return "".join(f"<details class='noprint' id='f-{e(r['finding_id'])}'><summary>Evidence for {e(r['finding_id'])} ({e(r['asset'])}, {e(r['environment'])})</summary>"
+    """Per-instance evidence, kept for traceability; collapsed on screen, opened for print."""
+    return "".join(f"<details class='inst-ev' id='f-{e(r['finding_id'])}'><summary>Evidence for {e(r['finding_id'])} ({e(r['asset'])}, {e(r['environment'])})</summary>"
                    f"{_evidence_points(r.get('evidence', []), 3)}<p class='muted'>{prose(r.get('provenance'))}</p></details>" for r in rows)
 
 
@@ -2589,8 +3200,9 @@ def _attack_summary(chains: List[dict], by_id: Dict[str, dict]) -> str:
                 recs.append(f"<li><b>{e(label)}:</b> {prose(_trim(steps[0], 200)) if steps else 'See the finding entry.'}</li>")
             rows.append(f"<tr><td class='c'>{i}</td><td><b>{e(st['stage'])}</b> ({state})<ul class='items'>{''.join(acts)}</ul></td>"
                         f"<td><ul class='items'>{''.join(recs)}</ul></td></tr>")
-        n_env = sum(1 for x in chains if x["chain_id"].split(":")[0] == rule)
-        out.append(f"<h4>{e(c['name'])} <span class='muted'>({e(c['environment'])}{f'; the same path exists in {n_env - 1} other environment(s)' if n_env > 1 else ''})</span></h4>"
+        others = sorted({x["environment"] for x in chains if x["chain_id"].split(":")[0] == rule and x is not c and x["status"] == "confirmed"})
+        also = f"; also fully confirmed in {', '.join(others)}" if others else ""
+        out.append(f"<h4>{e(c['name'])} <span class='muted'>({e(c['environment'])}{e(also)})</span></h4>"
                    f"<p>{e(c['why'])}</p><table class='grid steps'><thead><tr><th>Step</th><th>Action</th><th>Recommendation</th></tr></thead><tbody>{''.join(rows)}</tbody></table>")
     return "".join(out) or "<p class='muted'>No combination of confirmed findings in a single environment forms a known attack progression.</p>"
 
@@ -2598,162 +3210,195 @@ def _attack_summary(chains: List[dict], by_id: Dict[str, dict]) -> str:
 # ---------------------------------------------------------------------------
 # Report design
 # ---------------------------------------------------------------------------
-# Both reports share one visual system: ink-black and warm paper, a vermilion
-# signal colour and an acid-lime highlight, an editorial serif for headings, a
-# grotesque for body copy and a monospace for labels and evidence (the code
-# panels use the same night-mode palette as a code editor). Section headings sit
-# in a left rail beside their content on wide screens; print and phones fall
-# back to a single column. Fonts load from Google Fonts and degrade to the
-# local fallbacks below when offline or printed without a network.
-FONT_LINKS = (
-    '<link rel="preconnect" href="https://fonts.googleapis.com">'
-    '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
-    '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,700;9..144,900'
-    '&family=Hanken+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap">')
+# Both reports share one visual system: a deep teal ground with pale aqua text, hairline rules, an amber signal
+# colour for High and "Fix now", coral for Critical, and a mint panel for the fix. Headings are tight uppercase
+# grotesque, labels and evidence are monospace, and evidence sits in terminal-style panels. The cover carries a faint
+# contour texture. Only locally installed fonts are used, so the page is self-contained and makes no network
+# requests. Printing switches to a light palette.
+FONT_LINKS = ""  # no web fonts: a confidential report must open offline and must not call third parties
 
 REPORT_BASE_CSS = """
-:root{--paper:#f4efe4;--sheet:#fffdf8;--ink:#14110f;--muted:#5d564c;--line:#d8d0c0;--soft:#ece5d6;--night:#0e1218;--night2:#1a212b;
---accent:#14110f;--red:#ff4a1c;--lime:#c9ff3b;--crit:#b3123a;--high:#d9480f;--med:#8f6200;--low:#2b7a4b;--conf:#b3123a;--fp:#2b7a4b;--nr:#8f6200;
---display:"Fraunces","Iowan Old Style","Palatino Linotype",Georgia,serif;--body:"Hanken Grotesk","Avenir Next","Gill Sans",Optima,sans-serif;
---mono:"JetBrains Mono","SF Mono",Menlo,Consolas,monospace}
-*{box-sizing:border-box;-webkit-print-color-adjust:exact;print-color-adjust:exact}
-body{margin:0;color:var(--ink);font:15px/1.65 var(--body);background-color:var(--paper);
- background-image:linear-gradient(135deg,rgba(255,74,28,.10) 0,rgba(255,74,28,0) 38%),
-  repeating-linear-gradient(90deg,rgba(20,17,15,.045) 0 1px,transparent 1px 44px),
-  repeating-linear-gradient(0deg,rgba(20,17,15,.045) 0 1px,transparent 1px 44px)}
-a{color:var(--ink);text-decoration-color:var(--red);text-decoration-thickness:2px;text-underline-offset:3px}
-a:hover{background:var(--lime)}
-.doc{max-width:1080px;margin:32px auto;background:var(--sheet);border:2px solid var(--ink);box-shadow:12px 12px 0 var(--ink)}
-.cover{position:relative;overflow:hidden;color:#f6f1e6;min-height:560px;padding:72px 64px 48px;display:grid;grid-template-rows:auto 1fr auto;gap:28px;
- background:radial-gradient(circle at 88% 12%,rgba(255,74,28,.85) 0,rgba(255,74,28,0) 34%),
-  radial-gradient(circle at 8% 100%,rgba(201,255,59,.22) 0,rgba(201,255,59,0) 40%),
-  repeating-linear-gradient(135deg,rgba(255,255,255,.05) 0 2px,transparent 2px 22px),
-  repeating-linear-gradient(90deg,rgba(255,255,255,.06) 0 1px,transparent 1px 64px),var(--night)}
-.cover::after{content:"";position:absolute;right:-90px;bottom:-90px;width:340px;height:340px;border:2px solid var(--lime);transform:rotate(18deg);opacity:.55}
-.cover .kicker{font:600 12px var(--mono);letter-spacing:.18em;text-transform:uppercase;color:var(--lime)}
-.cover .co{font:900 clamp(44px,8vw,96px)/.95 var(--display);letter-spacing:-.02em;align-self:end}
-.cover .tt{font:400 clamp(20px,3vw,30px)/1.25 var(--display);font-style:italic;max-width:620px;margin-top:14px;color:#ece4d2}
-.cover .rule{width:120px;height:8px;background:var(--lime);margin:26px 0 0}
-.cover .meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,max-content));gap:6px 40px;font:12.5px var(--mono);color:#cfc8b8;position:relative;z-index:1}
-.cover .meta span{display:block;color:var(--lime);font-size:10.5px;letter-spacing:.14em;text-transform:uppercase}
-.page{padding:36px 64px 12px;display:grid;grid-template-columns:190px minmax(0,1fr);column-gap:36px;counter-reset:sec}
-.page>*{grid-column:2;min-width:0}
-.page>h2{grid-column:1;align-self:start;position:sticky;top:14px;margin:30px 0 14px}
-h2{font:900 26px/1.05 var(--display);letter-spacing:-.01em;scroll-margin-top:14px;counter-increment:sec;border-top:6px solid var(--ink);padding-top:10px}
-h2::before{content:counter(sec,decimal-leading-zero);display:block;font:600 12px var(--mono);letter-spacing:.14em;color:var(--red);margin-bottom:6px}
-h3{font:700 22px/1.2 var(--display);margin:26px 0 8px;scroll-margin-top:14px}
-h4{font:600 11.5px var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin:20px 0 6px}
-p{margin:5px 0 11px}
-code{font:12.5px/1.5 var(--mono);background:rgba(20,17,15,.08);padding:1px 5px;border-radius:2px;word-break:break-word}
-.muted{color:var(--muted)} .lead{font-weight:700}
+:root{--paper:#061A1E;--sheet:#0A2229;--panel:#0F333B;--ink:#CAE2E4;--strong:#EAF5F6;--muted:#93ABAE;
+--line:rgba(202,226,228,.14);--line2:rgba(202,226,228,.08);--soft:rgba(202,226,228,.06);--amber:#F0B429;--mint:#E6FFEC;
+--green:#30A46C;--code:#15181A;--code-ink:#CAE2E4;--on-fill:#061A1E;
+--crit:#FF7A66;--high:#F0B429;--med:#9CC9CE;--low:#30A46C;--conf:#FF7A66;--fp:#30A46C;--nr:#9CC9CE;--accent:#9CC9CE;
+--display:"Archivo","SF Pro Display","Helvetica Neue","Segoe UI",system-ui,sans-serif;
+--body:"Archivo","SF Pro Text","Helvetica Neue","Segoe UI",system-ui,sans-serif;
+--mono:"DM Mono","SF Mono",ui-monospace,Menlo,Consolas,monospace}
+*{box-sizing:border-box}
+body{margin:0;color:var(--ink);background:var(--paper);font:15px/1.65 var(--body)}
+a{color:var(--mint);text-decoration-color:rgba(230,255,236,.4);text-underline-offset:3px} a:hover{color:var(--amber)}
+.doc{max-width:1120px;margin:0 auto}
+.cover{position:relative;overflow:hidden;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#0A2229 0%,var(--paper) 100%)}
+.cover .topo{position:absolute;inset:0;width:100%;height:100%}
+.cover .in{position:relative;padding:72px 40px 56px;display:flex;flex-direction:column;gap:40px}
+.cover .kicker{font:500 12px var(--mono);letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}
+.cover h1{margin:0;font:600 clamp(40px,7vw,68px)/1 var(--display);letter-spacing:-.035em;text-transform:uppercase;color:var(--strong)}
+.cover .tt{margin:6px 0 0;font:600 clamp(40px,7vw,68px)/1 var(--display);letter-spacing:-.035em;text-transform:uppercase;color:rgba(202,226,228,.45)}
+.cover .meta{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));column-gap:24px}
+.cover .meta div{padding:14px 0 12px;border-top:1px solid var(--line);color:var(--strong)}
+.cover .meta span{display:block;font:500 11px var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:4px}
+.page{padding:56px 40px 24px;counter-reset:sec}
+h2{display:flex;align-items:baseline;gap:16px;margin:64px 0 20px;font:600 30px/1.1 var(--display);letter-spacing:-.02em;text-transform:uppercase;color:var(--strong);scroll-margin-top:14px;counter-increment:sec}
+h2::before{content:counter(sec,decimal-leading-zero);font:500 12px var(--mono);letter-spacing:0;color:var(--amber)}
+h3{font:600 22px/1.2 var(--display);letter-spacing:-.015em;color:var(--strong);margin:32px 0 10px;scroll-margin-top:14px}
+h4{font:500 11.5px var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:22px 0 8px}
+p{margin:6px 0 12px}
+code{font:12.5px/1.5 var(--mono);background:var(--soft);color:var(--strong);padding:1px 5px;border-radius:3px;word-break:break-word}
+.muted{color:var(--muted)} .lead{font-size:17px;color:var(--strong)}
 table{width:100%;border-collapse:collapse;font-size:13.5px}
-th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
-th{font:600 11px var(--mono);letter-spacing:.1em;text-transform:uppercase}
-table.grid th{background:var(--ink);color:var(--paper);border-bottom:0}
-.sevcell{font:700 12px var(--mono);letter-spacing:.06em;text-transform:uppercase;color:#fff;text-align:center;white-space:nowrap}
-.sc-critical{background:var(--crit)} .sc-high{background:var(--high)} .sc-medium{background:var(--med)} .sc-low{background:var(--low)} .sc-none{background:#6b655b}
-.sevtag,.sev,.cls,.tier{display:inline-block;font:700 11px var(--mono);letter-spacing:.06em;text-transform:uppercase;padding:2px 8px;border-radius:2px;color:#fff;background:#6b655b;white-space:nowrap}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line2);vertical-align:top}
+th{font:500 11px var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--line)}
+table.grid th{background:transparent}
+.sevcell{font:600 11.5px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--on-fill);text-align:center;white-space:nowrap}
+.sc-critical{background:var(--crit)} .sc-high{background:var(--high)} .sc-medium{background:var(--med)} .sc-low{background:var(--low)} .sc-none{background:var(--muted)}
+.sevtag,.sev,.cls,.tier{display:inline-block;font:600 11px var(--mono);letter-spacing:.08em;text-transform:uppercase;padding:3px 8px;border-radius:3px;color:var(--on-fill);background:var(--muted);white-space:nowrap}
 .sevtag{vertical-align:middle;margin-left:6px}
 .sev-critical{background:var(--crit)} .sev-high{background:var(--high)} .sev-medium{background:var(--med)} .sev-low{background:var(--low)}
 .cls-conf{background:var(--conf)} .cls-fp{background:var(--fp)} .cls-nr{background:var(--nr)}
-.callout{margin:16px 0;padding:16px 20px;background:var(--ink);color:var(--paper);border-left:10px solid var(--lime)}
-.callout b,.callout .big{font:700 20px/1.25 var(--display);display:block;margin-bottom:4px}
-.twocol{display:grid;grid-template-columns:1.25fr .75fr;gap:30px}
-.brow{display:grid;grid-template-columns:minmax(120px,42%) 1fr 28px;gap:10px;align-items:center;margin:6px 0;font-size:13px}
-.bt{height:12px;background:var(--soft);display:block} .bf{display:block;height:100%} .bv{text-align:right;font-family:var(--mono)} .bl a{text-decoration:none}
-.donut{display:flex;align-items:center;gap:16px;flex-wrap:wrap} .donut svg{width:140px;height:140px}
-.dn{font:900 28px var(--display);fill:var(--ink)} .ds{font:11px var(--mono);fill:var(--muted)}
-.legend{list-style:none;padding:0;margin:0} .legend li{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:13px} .legend i{width:12px;height:12px;display:inline-block}
-table.heat{border-collapse:separate;border-spacing:3px;width:auto} table.heat th{border:0;background:none;color:var(--muted);text-align:center;padding:3px}
+.callout{margin:18px 0;padding:18px 22px;background:var(--panel);border:1px solid var(--line);border-radius:6px;color:var(--ink)}
+.callout b,.callout .big{font:600 20px/1.25 var(--display);color:var(--amber);display:block;margin-bottom:4px}
+.twocol{display:grid;grid-template-columns:1.25fr .75fr;gap:32px}
+.brow{display:grid;grid-template-columns:minmax(120px,42%) 1fr 32px;gap:12px;align-items:center;margin:8px 0;font-size:13px}
+.bt{height:8px;background:var(--soft);border-radius:4px;display:block} .bf{display:block;height:100%;border-radius:4px} .bv{text-align:right;font-family:var(--mono)} .bl a{text-decoration:none}
+.donut{display:flex;align-items:center;gap:18px;flex-wrap:wrap} .donut svg{width:140px;height:140px}
+.dn{font:600 28px var(--display);fill:var(--strong)} .ds{font:11px var(--mono);fill:var(--muted)}
+.legend{list-style:none;padding:0;margin:0} .legend li{display:flex;align-items:center;gap:8px;margin:5px 0;font-size:13px} .legend i{width:10px;height:10px;border-radius:2px;display:inline-block}
+table.heat{border-collapse:separate;border-spacing:3px;width:auto} table.heat th{border:0;text-align:center;padding:3px}
 table.heat th[scope=row]{text-align:left;color:var(--ink)}
-td.hm{border:0;text-align:center;font:700 13px var(--mono);min-width:52px;height:30px;background:color-mix(in srgb,var(--c) calc(var(--a)*100%),transparent)}
-td.tot{border:0;text-align:center;font-weight:700}
-.count{font:600 11px var(--mono);letter-spacing:.04em;background:var(--lime);color:var(--ink);padding:2px 9px;margin-left:8px;vertical-align:middle;white-space:nowrap}
-.foot{padding:22px 64px 40px;color:var(--muted);font:12px var(--mono);letter-spacing:.04em;border-top:2px solid var(--ink)}
-@media (max-width:860px){.page{display:block;padding:20px 18px}.page>h2{position:static}.cover{padding:48px 22px 32px;min-height:440px}
- .twocol{grid-template-columns:1fr}.doc{margin:0;box-shadow:none;border-width:0}.foot{padding:18px}}
-@media print{body{background:#fff}.doc{box-shadow:none;border:0;margin:0;max-width:none}.cover{min-height:92vh;break-after:page}
- .page{display:block;padding:0 6px}.page>h2{position:static}h2{break-before:page;break-after:avoid}h3,h4{break-after:avoid}
- table,figure,.callout{break-inside:avoid}tr{break-inside:avoid}@page{margin:16mm 14mm}}
+td.hm{border:0;text-align:center;font:600 13px var(--mono);min-width:52px;height:30px;border-radius:3px;color:var(--strong);background:color-mix(in srgb,var(--c) calc(var(--a)*100%),transparent)}
+td.tot{border:0;text-align:center;font-weight:600}
+.count{font:500 11px var(--mono);letter-spacing:.04em;background:var(--mint);color:var(--on-fill);padding:2px 9px;border-radius:3px;margin-left:8px;vertical-align:middle;white-space:nowrap}
+h2 .count{font-size:11px;letter-spacing:.04em;text-transform:none}
+.foot{padding:24px 40px 40px;color:var(--muted);font:12px var(--mono);letter-spacing:.06em;border-top:1px solid var(--line);text-align:center}
+figure{margin:14px 0;background:var(--code);border:1px solid var(--line2);border-radius:6px;overflow:hidden;break-inside:avoid}
+figure pre{margin:0;padding:14px 16px;color:var(--code-ink);white-space:pre-wrap;word-break:break-word;font:12.5px/1.6 var(--mono);border-left:3px solid var(--amber)}
+figcaption{padding:8px 16px;border-top:1px solid var(--line2);font:12px var(--mono);color:var(--muted)} .src{text-transform:uppercase;font-size:10.5px;letter-spacing:.1em;color:var(--amber)}
+.printonly{display:none}
+@media (max-width:860px){.page{padding:28px 16px}.cover .in{padding:48px 16px 36px}.twocol{grid-template-columns:1fr}.foot{padding:18px 16px}
+}
+@media print{
+ :root{--paper:#fff;--sheet:#fff;--panel:#F2F6F6;--ink:#1D2B2E;--strong:#0A2229;--muted:#4F6265;--line:#C9D6D7;--line2:#E1E8E9;
+  --soft:#EEF3F3;--code:#F4F6F6;--code-ink:#0A2229;--amber:#9A6A00;--mint:#E6FFEC;--high:#E3A21A;--med:#7FB3B9}
+ *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+ .cover{background:#0A2229;min-height:92vh;break-after:page;--strong:#EAF5F6;--muted:#93ABAE;--line:rgba(202,226,228,.2);--amber:#F0B429}
+ .cover h1,.cover .meta div{color:#EAF5F6} .cover .tt{color:rgba(202,226,228,.5)}
+ .page{padding:0 6px} h2{break-before:page;break-after:avoid} h3,h4{break-after:avoid}
+ table,figure,.callout{break-inside:avoid} tr{break-inside:avoid} .noprint{display:none} .printonly{display:inline}
+ @page{margin:16mm 14mm}}
 """
 
 ANALYST_CSS = """
-.toc{columns:2;column-gap:36px;list-style:none;padding:0;counter-reset:toc}
-.toc li{padding:5px 0;border-bottom:1px solid var(--line);break-inside:avoid} .toc a{text-decoration:none;font-weight:500}
-.fcode{font:600 12.5px var(--mono);background:var(--lime);padding:2px 7px;margin-right:4px}
-table.kv{margin:8px 0 14px} table.kv th{width:130px;white-space:nowrap;background:var(--soft);color:var(--ink)}
-td.c{text-align:center;font-weight:700;width:46px}
-.tier{background:transparent;color:var(--ink);border:1px solid var(--ink);font-weight:600} .tier-chase{border-color:var(--crit);color:var(--crit)} .tier-look{border-color:var(--med);color:var(--med)}
-ul.items,ul.plain{margin:0;padding-left:18px} ul.plain{list-style:none;padding:0} ul.items li{margin:5px 0}
-figure{margin:14px 0;border:1px solid var(--night);break-inside:avoid;background:var(--night)}
-figure pre{margin:0;padding:12px 14px;color:#e6edf3;white-space:pre-wrap;word-break:break-word;font:12px/1.55 var(--mono);border-left:4px solid var(--lime)}
-figcaption{padding:7px 14px;background:var(--night2);font:11.5px var(--mono);color:#a9b3c1} .src{text-transform:uppercase;font-size:10.5px;letter-spacing:.1em;color:var(--lime)}
-ul.chips{list-style:none;padding:0;margin:8px 0 0;display:flex;flex-wrap:wrap;gap:6px}
-.chips li{border:1px solid var(--ink);padding:3px 8px;font-size:11.5px;line-height:1.3} .chips li span{display:block;color:var(--muted)} .chips li.hot{background:rgba(255,74,28,.12);border-color:var(--red)}
-.note{font-size:13px;background:var(--soft);padding:6px 10px} .banner{border:2px solid var(--crit);background:rgba(179,18,58,.08);padding:10px 14px;margin:12px 0}
+.toc{columns:2;column-gap:40px;list-style:none;padding:0;counter-reset:toc;font:13px var(--mono)}
+.toc li{padding:7px 0;border-bottom:1px solid var(--line2);break-inside:avoid} .toc a{text-decoration:none;color:var(--ink)} .toc a:hover{color:var(--amber)}
+.fcode{font:500 12.5px var(--mono);background:var(--mint);color:var(--on-fill);padding:3px 9px;border-radius:3px;margin-right:6px;vertical-align:middle}
+section.finding{border-top:1px solid var(--line);padding-top:8px;margin-top:40px}
+section.finding h3{font-size:24px;text-transform:uppercase;letter-spacing:-.02em}
+table.kv{margin:10px 0 16px;border:1px solid var(--line);border-radius:6px;border-collapse:separate;border-spacing:0;overflow:hidden}
+table.kv th{width:150px;white-space:nowrap;background:var(--panel);color:var(--muted);border-bottom:1px solid var(--line2)}
+table.kv td{border-bottom:1px solid var(--line2)} table.kv tr:last-child th,table.kv tr:last-child td{border-bottom:0}
+table.kv.remed{background:var(--mint);color:#0A2229;border-color:transparent}
+table.kv.remed th{background:rgba(10,34,41,.08);color:#0F333B} table.kv.remed td{border-color:rgba(10,34,41,.12)}
+table.kv.remed code{background:rgba(10,34,41,.08);color:#0A2229} table.kv.remed a{color:#0F333B}
+td.c{text-align:center;font-weight:600;width:46px;font-family:var(--mono);color:var(--amber)}
+.tier{background:transparent;color:var(--ink);border:1px solid var(--line);font-weight:500} .tier-chase{border-color:var(--amber);color:var(--amber)} .tier-look{border-color:var(--med);color:var(--med)}
+ul.items,ul.plain{margin:0;padding-left:18px} ul.plain{list-style:none;padding:0} ul.items li{margin:6px 0}
+ul.chips{list-style:none;padding:0;margin:10px 0 0;display:flex;flex-wrap:wrap;gap:6px}
+.chips li{border:1px solid var(--line);border-radius:3px;padding:3px 8px;font:11.5px/1.3 var(--mono)} .chips li span{display:block;color:var(--muted)} .chips li.hot{border-color:rgba(240,180,41,.55);color:var(--amber)}
+.note{font-size:13px;background:var(--soft);border-radius:4px;padding:7px 11px} .banner{border:1px solid var(--crit);background:rgba(255,122,102,.08);border-radius:6px;padding:12px 16px;margin:14px 0}
 .bars{margin-top:4px}
-details{margin:6px 0;font-size:13px} summary{cursor:pointer;font-weight:700}
-ul.proof{list-style:none;padding:0} ul.proof li{border-left:4px solid var(--ink);padding:3px 0 3px 12px;margin:8px 0} ul.proof li b{display:block}
-code.quote{display:block;white-space:pre-wrap}
-details.nrg{border:1px solid var(--ink);padding:8px 14px;margin:8px 0} details.nrg summary small{display:block;font-weight:400;color:var(--muted)}
+details{margin:6px 0;font-size:13px} summary{cursor:pointer;font-weight:600;color:var(--strong)}
+ul.proof{list-style:none;padding:0} ul.proof li{border-left:3px solid var(--amber);padding:3px 0 3px 12px;margin:10px 0} ul.proof li b{display:block;color:var(--strong)}
+code.quote{display:block;white-space:pre-wrap;background:var(--code);padding:8px 10px;margin-top:4px}
+details.nrg{border:1px solid var(--line);border-radius:6px;padding:10px 16px;margin:10px 0;background:var(--sheet)} details.nrg summary small{display:block;font-weight:400;color:var(--muted)}
 .tablewrap{overflow-x:auto} td.reason{min-width:300px}
-.filters{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
-.filters input{flex:1;min-width:200px;padding:8px;border:2px solid var(--ink);background:#fff;font:13px var(--mono)}
-.filters button{padding:7px 13px;border:2px solid var(--ink);background:#fff;cursor:pointer;font:600 12px var(--mono)}
-.filters button.on{background:var(--ink);color:var(--lime)}
+.filters{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
+.filters input{flex:1;min-width:200px;padding:10px;border:1px solid var(--line);border-radius:4px;background:var(--sheet);color:var(--strong);font:13px var(--mono)}
+.filters button{padding:9px 14px;min-height:40px;border:1px solid var(--line);border-radius:4px;background:transparent;color:var(--ink);cursor:pointer;font:500 12px var(--mono)}
+.filters button.on{background:var(--mint);color:var(--on-fill);border-color:var(--mint)}
 @media (max-width:860px){.toc{columns:1}}
-@media print{.noprint,.filters{display:none}.finding{break-before:page}}
+@media print{.filters{display:none}.finding{break-before:page}}
 """
 
 CLIENT_CSS = """
-h4{margin:4px 0 6px}
-.posture{display:grid;grid-template-columns:auto 1fr;gap:2px 26px;align-items:center;border:2px solid var(--ink);border-left:16px solid var(--c);padding:16px 24px;margin:6px 0 18px;background:var(--sheet)}
-.posture .plabel{grid-column:1/-1;font:600 11px var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
-.posture b{font:900 clamp(30px,5vw,46px)/1.05 var(--display);color:var(--c)} .posture p{margin:0;font-size:15px}
-ul.brief{padding-left:20px;margin:4px 0 8px} ul.brief li{margin:7px 0}
-table.where th{background:var(--soft);color:var(--ink)} table.sevsum{width:auto;min-width:360px;margin:6px 0 12px} table.sevsum tr.tot td{background:var(--soft)}
-th{background:var(--ink);color:var(--paper);border-bottom:0} td.n{text-align:center;font-weight:700;font-family:var(--mono)}
-.env{display:inline-block;font:600 11px var(--mono);padding:1px 7px;background:var(--soft);border:1px solid var(--line);margin:1px 3px 1px 0;white-space:nowrap}
-.env-production{background:rgba(255,74,28,.14);border-color:var(--red)}
-.bars .brow{grid-template-columns:minmax(110px,40%) 1fr 26px}
-.entry{border:2px solid var(--ink);border-left:14px solid var(--ink);padding:18px 24px;margin:22px 0;background:var(--sheet);box-shadow:6px 6px 0 var(--soft)}
-.sc-b-critical{border-left-color:var(--crit)} .sc-b-high{border-left-color:var(--high)} .sc-b-medium{border-left-color:var(--med)} .sc-b-low{border-left-color:var(--low)}
-.entry header{display:grid;grid-template-columns:auto 1fr auto;gap:16px;align-items:start}
-.num{font:900 44px/1 var(--display);color:var(--red)}
-.entry h3{margin:0;font-size:24px}
-.sub{color:var(--muted);font-size:13px;margin-top:3px}
-.score{text-align:right} .score b{display:block;font:900 44px/1 var(--display)} .score small{font:11px var(--mono);color:var(--muted);letter-spacing:.08em}
-.vec{margin:8px 0 0}
-.cols{display:grid;grid-template-columns:1.5fr 1fr;gap:28px;margin-top:10px}
+.posture{display:grid;grid-template-columns:auto 1fr;gap:4px 28px;align-items:center;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:22px 26px;margin:8px 0 20px}
+.posture .plabel{grid-column:1/-1;font:500 11px var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.posture b{font:600 clamp(32px,5vw,46px)/1 var(--display);letter-spacing:-.03em;text-transform:uppercase;color:var(--c)} .posture p{margin:0;font-size:15px}
+ul.brief{padding-left:20px;margin:6px 0 10px} ul.brief li{margin:8px 0} ul.brief li.lead{font-size:16px}
+table.sevsum{width:auto;min-width:360px;margin:8px 0 14px;border:1px solid var(--line);border-radius:6px;border-collapse:separate;border-spacing:0;overflow:hidden}
+table.sevsum tr.tot td{background:var(--soft);font-weight:600} td.n{text-align:center;font-weight:600;font-family:var(--mono)}
+.env{display:inline-block;font:500 11.5px var(--mono);padding:2px 8px;border:1px solid var(--line);border-radius:3px;margin:1px 4px 1px 0;white-space:nowrap;color:var(--ink)}
+.env-production{color:var(--amber);border-color:rgba(240,180,41,.5)}
+.bars .brow{grid-template-columns:minmax(110px,40%) 1fr 30px}
+ol.steps{margin:4px 0 8px;padding-left:22px} ol.steps li{margin:7px 0}
+.entry{background:var(--sheet);border:1px solid var(--line);border-radius:8px;margin:26px 0;overflow:hidden}
+.entry header{display:grid;grid-template-columns:auto 1fr auto;gap:18px;align-items:start;padding:26px 30px;border-bottom:1px solid var(--line)}
+.num{font:500 13px var(--mono);color:var(--amber);padding-top:8px}
+.entry h3{margin:0;font-size:26px;line-height:1.15}
+.sub{color:var(--muted);font:12.5px/1.5 var(--mono);margin-top:6px}
+.score{text-align:right} .score b{display:block;font:600 52px/1 var(--display);letter-spacing:-.03em;color:var(--strong);margin-top:6px}
+.sc-b-critical .score b{color:var(--crit)} .sc-b-high .score b{color:var(--high)} .sc-b-medium .score b{color:var(--med)} .sc-b-low .score b{color:var(--low)}
+.score small{font:11px var(--mono);color:var(--muted);letter-spacing:.12em;text-transform:uppercase}
+.vec{margin:0;padding:12px 30px 0;font:12px var(--mono);color:var(--muted)} .vec code{background:transparent;padding:0;color:var(--muted)}
+.cols{display:grid;grid-template-columns:1.5fr 1fr;gap:0;margin-top:6px}
+.cols>section{padding:16px 30px 24px}
 .why{font-size:13px;color:var(--muted)}
-.fix{background:var(--ink);color:var(--paper);padding:10px 18px;border-top:6px solid var(--lime)} .fix h4{color:var(--lime)} .fix code{background:rgba(255,255,255,.14)}
-.fix a{color:var(--lime)}
-ol.steps{margin:2px 0 6px;padding-left:22px} ol.steps li{margin:6px 0} .verify{font-size:13px}
-.idbtn{white-space:nowrap;font:600 12.5px var(--mono);background:var(--lime);color:var(--ink);border:2px solid var(--ink);padding:2px 9px;cursor:pointer}
-.idbtn::before{content:"+ "} .idbtn[aria-expanded="true"]::before{content:"\\2212 "} .idbtn:hover,.idbtn:focus-visible{background:var(--ink);color:var(--lime)}
+.fix{background:var(--mint);color:#0A2229} .fix h4{color:#0F333B} .fix code{background:rgba(10,34,41,.08);color:#0A2229} .fix a{color:#0F333B}
+.verify{font-size:13.5px;border-top:1px solid rgba(10,34,41,.18);padding-top:10px}
+.entry>h4{padding:0 30px} .entry>table.where{margin:0 30px 8px;width:calc(100% - 60px)} .entry>.why{padding:0 30px 20px}
+.idbtn{white-space:nowrap;font:500 12.5px var(--mono);background:var(--mint);color:var(--on-fill);border:0;border-radius:3px;padding:6px 10px;min-height:32px;cursor:pointer}
+.idbtn::before{content:"+ "} .idbtn[aria-expanded="true"]::before{content:"\\2212 "} .idbtn:hover,.idbtn:focus-visible{background:var(--amber)}
 table.where td{overflow-wrap:anywhere}
-tr.evrow>td{background:var(--soft);padding:14px 18px;border-left:6px solid var(--lime)}
-.proof .pmeta{display:flex;flex-wrap:wrap;gap:6px 22px;font:12px var(--mono);color:var(--muted)} .proof .pmeta b{color:var(--ink)}
-.proof figure{margin:10px 0 4px;border:1px solid var(--night);background:var(--night)}
-.proof figcaption{padding:6px 12px;background:var(--night2);font:600 11px var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--lime)}
-.proof pre{margin:0;padding:12px 14px;max-height:360px;overflow:auto;color:#e6edf3;white-space:pre-wrap;word-break:break-word;font:12px/1.55 var(--mono)}
-.proof mark{background:var(--lime);color:var(--ink);padding:0 2px}
-ul.shows{margin:4px 0 10px;padding-left:20px;font-size:13px}
-@media print{tr.evrow[hidden]{display:none}.proof pre{max-height:none}}
-@media (max-width:860px){.cols{grid-template-columns:1fr}.entry{padding:14px}.entry header{grid-template-columns:auto 1fr}.score{grid-column:1/-1;text-align:left}}
-@media print{.entry{break-inside:avoid;box-shadow:none}}
+tr.evrow>td{background:var(--paper);padding:16px 18px;border-left:3px solid var(--amber)}
+.proof .pmeta{display:flex;flex-wrap:wrap;gap:6px 22px;font:12px var(--mono);color:var(--muted)} .proof .pmeta b{color:var(--strong)}
+.proof figure{margin:12px 0 4px}
+.proof figcaption{border-top:0;border-bottom:1px solid var(--line2);font:500 11px var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+.proof pre{margin:0;padding:14px 16px;max-height:360px;overflow:auto;color:var(--code-ink);white-space:pre-wrap;word-break:break-word;font:12.5px/1.6 var(--mono)}
+.proof mark{background:rgba(240,180,41,.25);color:var(--amber);padding:0 2px;border-radius:2px}
+ul.shows{margin:4px 0 12px;padding-left:20px;font-size:13px}
+@media print{tr.evrow[hidden]{display:none}.proof pre{max-height:none}.entry{break-inside:auto}.entry header{break-after:avoid}
+ .proof mark{background:#FCE8B2;color:#0A2229}}
+@media (max-width:860px){.cols{grid-template-columns:1fr}.entry header{grid-template-columns:auto 1fr;padding:18px}.score{grid-column:1/-1;text-align:left}
+ .cols>section{padding:14px 18px}.vec{padding:10px 18px 0}.entry>h4{padding:0 18px}.entry>table.where{margin:0 18px 8px;width:calc(100% - 36px)}.entry>.why{padding:0 18px 16px}}
 """
+
+_TOPO = ('<svg class="topo" aria-hidden="true" viewBox="0 0 1280 560" preserveAspectRatio="xMidYMid slice">'
+         '<g fill="none" stroke="rgba(202,226,228,0.07)" stroke-width="1">'
+         + "".join(f'<path d="M-40 {420 + d} C 180 {330 + d}, 300 {470 + d}, 520 {380 + d} S 860 {260 + d}, 1080 {340 + d} S 1320 {300 + d}, 1360 {260 + d}"></path>'
+                   for d in (0, 30, 60))
+         + "".join(f'<path d="M-40 {120 + d} C 140 {60 + d}, 320 {180 + d}, 560 {110 + d} S 900 {40 + d}, 1120 {120 + d} S 1300 {90 + d}, 1360 {60 + d}"></path>'
+                   for d in (0, 30))
+         + '<path d="M880 260 C 940 200, 1060 210, 1080 270 S 990 350, 930 320 S 850 300, 880 260"></path>'
+           '<path d="M850 262 C 920 170, 1100 180, 1115 272 S 1000 385, 920 352 S 815 310, 850 262"></path>'
+           '<path d="M820 264 C 900 140, 1140 150, 1150 274 S 1010 420, 905 384 S 780 318, 820 264"></path></g></svg>')
+
+
+def prepared_by(company: str = "", tester: str = "") -> str:
+    """'Jane Doe, Acme Security'; whichever parts were given, or '' when neither was."""
+    return ", ".join(x for x in (tester.strip(), company.strip()) if x)
+
+
+def _team_html(client: str, company: str, tester: str) -> str:
+    """Contact table for the assessment team and the client. Only names the user supplied are shown;
+    contact details are never invented."""
+    rows = []
+    if tester or company:
+        rows.append(f"<tr><td>{e(company or 'Not provided')}</td><td>{e(tester or 'Not provided')}</td><td>Report author</td><td>Not provided</td></tr>")
+    rows.append(f"<tr><td>{e(client)}</td><td>To be provided by {e(client)}</td><td>Client security contact</td><td>Not provided</td></tr>")
+    return ("<table class='grid'><thead><tr><th>Organization</th><th>Name</th><th>Role</th><th>Contact</th></tr></thead><tbody>"
+            + "".join(rows) + "</tbody></table>")
 
 
 def _cover(client_html: str, title: str, meta: List[Tuple[str, str]], kicker: str) -> str:
-    """The report cover: client name, title and a row of labelled facts."""
+    """The report cover: client name as the page's h1, the report title, and a row of labelled facts."""
     facts = "".join(f"<div><span>{e(k)}</span>{e(v)}</div>" for k, v in meta)
-    return (f'<header class="cover"><div class="kicker">{e(kicker)}</div>'
-            f'<div><div class="co">{client_html}</div><div class="tt">{e(title)}</div><div class="rule"></div></div>'
-            f'<div class="meta">{facts}</div></header>')
+    return (f'<header class="cover">{_TOPO}<div class="in"><div class="kicker">{e(kicker)}</div>'
+            f'<div><h1>{client_html}</h1><p class="tt">{e(title)}</p></div>'
+            f'<div class="meta">{facts}</div></div></header>')
 
 
-def build_report(results: List[dict], source_name: str, model: str, chains: List[dict] = (), client: str = "Client") -> str:
+def build_report(results: List[dict], source_name: str, model: str, chains: List[dict] = (), client: str = "Client",
+                 company: str = "", tester: str = "") -> str:
     """Render the technical report for internal analysts and engineers.
 
     It carries every verdict, including false positives and findings that need more evidence, with the evidence,
@@ -2765,22 +3410,25 @@ def build_report(results: List[dict], source_name: str, model: str, chains: List
         model: Description of the models that answered.
         chains: Attack chains correlated from the confirmed findings.
         client: Client name shown in headings.
+        company: The reporting company (shown as author when given).
+        tester: The assessor's name (shown as author when given).
 
     Returns:
         A self-contained HTML page.
     """
     cl = e(client)
+    author = prepared_by(company, tester)
+    co = e(company) if company else "the assessment team"
     counts = collections.Counter(r["classification"] for r in results)
     confirmed = [r for r in results if r["classification"] == "Confirmed"]
     nr = [r for r in results if r["classification"] == "Needs Review"]
     fp = [r for r in results if r["classification"] == "False Positive"]
     by_id = {r["finding_id"]: r for r in results}
-    groups = _group_by_issue(confirmed)
-    ranked = sorted(groups.items(), key=lambda kv: (_priority_key(kv[1][0]), kv[0]))
-    top = sorted(confirmed, key=_priority_key)[:3]
+    issues = issue_groups(confirmed)
+    top = issues[:3]
     tiers = collections.Counter(r.get("priority_tier") for r in confirmed)
     sev = collections.Counter(r.get("cvss_severity") for r in confirmed)
-    prod = [r for r in confirmed if r["environment"].strip().lower() == "production"]
+    prod = [r for r in confirmed if env_class(r["environment"]) == "production"]
     prod_hi = sum(1 for r in prod if r.get("cvss_severity") in ("Critical", "High"))
     adjudicated = sum(1 for r in results if r.get("adjudicated"))
     gated = sum(1 for r in results if r.get("gated_from"))
@@ -2788,12 +3436,20 @@ def build_report(results: List[dict], source_name: str, model: str, chains: List
     consistency = sum(1 for r in results if "consistency gate" in (r.get("gate_notes") or ""))
     evidence_gated = gated - consistency
     n_conf_chains = sum(1 for c in chains if c["status"] == "confirmed")
-    seen = sorted(r.get("first_observed_utc", "")[:10] for r in results if r.get("first_observed_utc"))
-    window = _date_window(seen)
+    window, date_note = _observed(results)
+    report_date = _fmt_date(dt.date.today())
     weights = ", ".join(f"{k} {v}" for k, v in ENV_WEIGHT.items())
-    type_names = {k: issue_label(k, g[0]) for k, g in groups.items()}
+    def name(g: List[dict]) -> str:
+        """'SQL injection: SQL injection in vehicle lookup', without repeating a label the title already starts with."""
+        label, title = issue_label(issue_key(g[0]), g[0]), display_title(g[0])
+        return title if title.lower().startswith(label.lower()[:12]) else f"{label}: {title}"
     error_banner = (f"<div class='banner'><strong>{errors} finding(s) could not be assessed automatically</strong> "
                     f"and are listed as informational (needs review) pending manual assessment.</div>") if errors else ""
+    flagged = [r["finding_id"] for r in confirmed if (r.get("fact_check") or {}).get("status") == "flagged"]
+    if flagged:
+        error_banner += (f"<div class='banner'><strong>Client text held for review:</strong> the impact or title for "
+                         f"{_plural(len(flagged), 'issue', 'issues')} ({e(', '.join(flagged))}) still carries a claim the "
+                         f"evidence does not support. Correct it before the executive report is sent.</div>")
     counter = [0]
 
     # --- tables used by the front matter ---
@@ -2807,37 +3463,43 @@ def build_report(results: List[dict], source_name: str, model: str, chains: List
     sev_rows = "".join(f"<tr><td class='sevcell sc-{n.lower() if n != 'Moderate' else 'medium'}'>{n}</td><td>{rng}</td><td>{d}</td></tr>" for n, rng, d in SEV_DEFS)
 
     # --- executive summary ---
-    worst_types = ", ".join(type_names[k] for k, _ in ranked[:3])
-    exec_text = (f"The security tooling at {cl} produced {len(results)} raw findings between {window}. Each was evaluated against the evidence supplied "
-                 f"(runtime requests and responses, traces, logs, source and deployment records, owner comments) and not against the scanner's own severity label. "
-                 f"{counts['Confirmed']} findings are confirmed real, {counts['False Positive']} are false alarms, and {counts['Needs Review']} cannot be decided without more evidence. "
-                 f"The confirmed findings fall into {len(groups)} issue types; the client report lists {len({client_issue_key(r) for r in confirmed})} distinct issues because it keeps two flaws of the same type apart when their scored scenarios differ. "
-                 f"{_plural(len(prod), 'confirmed finding affects', 'confirmed findings affect')} production, {prod_hi} of them rated High or Critical. "
-                 f"It is highly recommended that {cl} address {worst_types} first.")
-    weak = "".join(f"<h4>{e(type_names[k])}</h4>{_impact_block(g[0].get('business_impact'))}" for k, g in ranked[:4])
-    fp_groups = _group_by_issue(fp, _title_key)
+    first_names = [display_title(g[0]) for g in top]
+    first_text = (", ".join(first_names[:-1]) + " and " + first_names[-1]) if len(first_names) > 1 else "".join(first_names)
+    exec_text = (f"{cl}'s security tooling produced {_plural(len(results), 'raw finding', 'raw findings')}{_observed_from(window)}. Each was evaluated against the evidence supplied "
+                 f"with it (runtime requests and responses, traces, logs, source and deployment records, owner comments), not against the scanner's own severity label. "
+                 f"Of these, {counts['Confirmed']} {'is' if counts['Confirmed'] == 1 else 'are'} confirmed, {counts['False Positive']} "
+                 f"{'is a false positive' if counts['False Positive'] == 1 else 'are false positives'}, and {counts['Needs Review']} "
+                 f"cannot be decided without more evidence. "
+                 f"The confirmed findings are {_plural(len(issues), 'distinct issue', 'distinct issues')}. "
+                 f"{_plural(len(prod), 'confirmed finding is', 'confirmed findings are')} in production, {prod_hi} of them rated High or Critical. "
+                 + (f"Fix these first: {first_text}." if first_text else ""))
+    weak = "".join(f"<h4>{e(name(g))}</h4>{_impact_block(g[0].get('business_impact'))}" for g in top)
+    fp_groups: Dict[Tuple[str, str], List[dict]] = {}
+    for r in sorted(fp, key=_title_key):
+        fp_groups.setdefault(flaw_key(r), []).append(r)
     strengths = ""
-    for k, g in sorted(fp_groups.items(), key=lambda kv: -len(kv[1]))[:4]:
+    for k, g in sorted(fp_groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:4]:
         ss = _sentences(g[0].get("reasoning"))
-        strengths += (f"<h4>{len(g)} reported {e(issue_label(k, g[0]).lower())} case{'s' if len(g) != 1 else ''} shown not exploitable</h4>"
-                      f"<p>{prose(' '.join(ss[:3]))}</p>")
+        strengths += (f"<h4>{e(g[0]['finding_title'])}: {_plural(len(g), 'finding', 'findings')} closed as false positives</h4>"
+                      f"<p><b>Example {e(g[0]['finding_id'])}.</b> {prose(' '.join(ss[:2]))}</p>")
     sev_bars = _bar_rows([(SEV_DISPLAY.get(s, s), sev.get(s, 0), SEV_COLOR[s], "") for s in ("Critical", "High", "Medium", "Low")],
                          max(sev.values(), default=1))
     heat = _heatmap(confirmed).replace(">Medium<", ">Moderate<")
-    type_bars = _bar_rows([(type_names[k], len(g), SEV_COLOR.get(_worst(g).get("cvss_severity"), "var(--accent)"), f"#issue-{k}")
-                           for k, g in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))], max((len(g) for g in groups.values()), default=1))
+    type_bars = _bar_rows([(issue_label(issue_key(g[0]), g[0]), len(g), SEV_COLOR.get(_worst(g).get("cvss_severity"), "var(--accent)"), f"#{flaw_anchor(flaw_key(g[0]))}")
+                           for g in sorted(issues, key=lambda g: -len(g))], max((len(g) for g in issues), default=1))
     donut = _donut([("Confirmed", counts["Confirmed"], "var(--conf)"), ("Informational: needs review", counts["Needs Review"], "var(--nr)"),
                     ("Informational: false positive", counts["False Positive"], "var(--fp)")], str(len(results)), "findings")
 
     # --- technical findings ---
-    priority_html = "".join(_tcm_finding(f"P-{i}", f"top-{i}", display_title(r), r, [r], counter,
-                                         badge=" <span class='tier tier-chase'>Top priority</span>" if True else "")
-                            for i, r in enumerate(top, 1)) or "<p>No findings met the confirmation standard.</p>"
+    priority_html = "".join(
+        f"<li><a href='#{flaw_anchor(flaw_key(g[0]))}'><b>F-{i:02d}</b> {e(display_title(g[0]))}</a> "
+        f"<span class='sevtag sc-{e((g[0].get('cvss_severity') or 'none').lower())}'>{e(SEV_DISPLAY.get(g[0].get('cvss_severity'), g[0].get('cvss_severity') or ''))}</span> "
+        f"CVSS {e(g[0].get('cvss_score'))}, {e(_reach(g))}, {sum(1 for r in g if _is_prod(r))} in production.</li>"
+        for i, g in enumerate(top, 1))
+    priority_html = f"<ol class='items'>{priority_html}</ol>" if priority_html else "<p>No findings met the confirmation standard.</p>"
     issue_html = []
-    for i, (k, g) in enumerate(ranked, 1):
-        lead = g[0]
-        issue_html.append(_tcm_finding(f"F-{i:02d}", f"issue-{k}", type_names[k] + f": {display_title(lead)}",
-                                       lead, g[:1] if len(g) == 1 else g, counter,
+    for i, g in enumerate(issues, 1):
+        issue_html.append(_tcm_finding(f"F-{i:02d}", flaw_anchor(flaw_key(g[0])), name(g), g[0], g, counter,
                                        extra_instances=_instances_table(g) + _instance_evidence(g, counter)))
     nr_html = _needs_review_html(nr)
     fp_html = ("<table class='grid'><thead><tr><th>ID</th><th>Title</th><th>System</th><th>Env</th><th>Why it is not exploitable as reported</th></tr></thead><tbody>"
@@ -2852,15 +3514,15 @@ def build_report(results: List[dict], source_name: str, model: str, chains: List
            ("overview", "Assessment Overview"), ("severity", "Finding Severity Ratings"), ("scope", "Scope"),
            ("exec", "Assessment Summary"), ("attack-summary", "&nbsp;&nbsp;Attack Summary"), ("strengths", "&nbsp;&nbsp;Security Strengths"),
            ("weaknesses", "&nbsp;&nbsp;Security Weaknesses"), ("impact", "&nbsp;&nbsp;Vulnerabilities by Impact"),
-           ("findings", "Technical Findings"), ("priority", "&nbsp;&nbsp;Top Priority Findings"), ("confirmed", "&nbsp;&nbsp;All Confirmed Findings by Issue Type"),
+           ("findings", "Technical Findings"), ("priority", "&nbsp;&nbsp;Top Priority Issues"), ("confirmed", "&nbsp;&nbsp;All Confirmed Issues"),
            ("informational", "Additional Reports and Scans (Informational)"), ("method", "Assessment Method and Limitations"), ("appendix", "Appendix: Every Finding")]
-    toc_html = "".join(f"<li><a href='#{a}'>{t}</a></li>" for a, t in toc)
+    toc_html = "".join(f"<li{' class=noprint' if a == 'appendix' else ''}><a href='#{a}'>{t}</a></li>" for a, t in toc)
 
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{cl} Technical Assessment Report (Analyst Edition)</title>
 {FONT_LINKS}<style>{REPORT_BASE_CSS}{ANALYST_CSS}</style></head><body><div class="doc">
-{_cover(cl, "Technical Assessment Report", [("Edition", "Analyst, for the internal security team"), ("Classification", "Business Confidential"), ("Evidence period", window), ("Source data", source_name), ("Version", "1.0")], "Analyst edition")}
+{_cover(cl, "Technical Assessment Report", [("Edition", "Analyst, for the internal security team"), ("Prepared for", client)] + ([("Prepared by", author)] if author else []) + [("Classification", "Business Confidential"), ("Report date", report_date), ("Findings observed", window or "Not recorded in the source data"), ("Source data", source_name), ("Version", "1.0")], "Analyst edition")}
 <div class="page">
 {error_banner}
 <h2 style="break-before:auto">Table of Contents</h2><ol class="toc" style="list-style:none">{toc_html}</ol>
@@ -2868,42 +3530,44 @@ def build_report(results: List[dict], source_name: str, model: str, chains: List
 <h2 id="audience">How to Use This Report</h2>
 <p>This is the technical record of the assessment. It is written for the analysts and engineers who verify findings, reproduce them and ship the fixes. Every finding in the source data has a decision here, including the false positives and the findings that need more evidence, each with its reason.</p>
 <p>Each confirmed finding carries its CVSS 3.1 vector with a reason for every metric, the exact evidence it rests on, how the flaw was reproduced and an ordered fix. The companion executive report carries only the confirmed issues, in business terms, for the people who fund and own the risk.</p>
-<table class="kv"><tbody><tr><th>Start with</th><td>Top Priority Findings. Read each entry's evidence figures before the conclusion, then check the CVSS reasoning against your own view of the system.</td></tr>
-<tr><th>Then</th><td>All Confirmed Findings by Issue Type, which lists every affected system once per issue.</td></tr>
+<table class="kv"><tbody><tr><th>Start with</th><td>Top Priority Issues. Read each entry's evidence figures before the conclusion, then check the CVSS reasoning against your own view of the system.</td></tr>
+<tr><th>Then</th><td>All Confirmed Issues, which lists every affected finding once per issue.</td></tr>
 <tr><th>Open questions</th><td>Findings that need more evidence. Treat the follow-up under each one as your test plan.</td></tr>
 <tr><th>Any single row</th><td>The appendix filters all findings by outcome and by text.</td></tr></tbody></table>
 
 <h2 id="confidentiality">Confidentiality Statement</h2>
-<p>This document is the exclusive property of {cl} and the assessment team. It contains proprietary and confidential information. Duplication, redistribution, or use, in whole or in part, in any form, requires consent of both parties.</p>
-<p>{cl} may share this document with auditors under non-disclosure agreements to demonstrate security assessment compliance.</p>
+<p>This document is the exclusive property of {cl} and {co}. It contains proprietary and confidential information. Duplication, redistribution, or use, in whole or in part, in any form, requires consent of both {cl} and {co}.</p>
+<p>This document is an evidence-based triage of existing scanner findings. It is not a penetration test report and should not be presented as one.</p>
 
 <h2 id="disclaimer">Disclaimer</h2>
-<p>This assessment is a snapshot in time. The findings and recommendations reflect the evidence gathered during the observation period and not any changes made outside of it.</p>
+<p>This assessment is a snapshot in time. The findings and recommendations reflect the evidence supplied with each finding{e(_observed_from(window))}, and not any changes made outside of it.{(" " + e(date_note)) if date_note else ""}</p>
 <p>The assessment rests on the evidence supplied with each finding and did not include new testing against any system. It does not evaluate every security control. It prioritizes the weaknesses an attacker would exploit first. Similar assessments should be repeated on a regular schedule by internal or third-party reviewers to confirm that controls continue to hold.</p>
 
 <h2 id="contacts">Contact Information</h2>
+{_team_html(client, company, tester)}
+<h4>Asset owner teams named in the findings</h4>
 <table class="grid"><thead><tr><th>Asset owner team</th><th>Scope of findings</th><th>Contact</th></tr></thead><tbody>{owner_rows}</tbody></table>
 
 <h2 id="overview">Assessment Overview</h2>
-<p>For findings first observed between {e(window)}, {cl}'s scanning and testing produced {len(results)} raw findings. These were adjudicated to separate real, exploitable issues from false alarms and from questions the evidence cannot answer. Phases of the assessment:</p>
-<ul><li><b>Planning:</b> The raw findings file was read as real CSV, preserving multiline fields, and every row was given exactly one outcome.</li>
-<li><b>Discovery:</b> Request IDs, code revisions, identities and side-effect boundaries were correlated across requests, responses, logs, traces, source excerpts, manifests and owner comments.</li>
-<li><b>Adjudication:</b> Each finding received two independent reviews, with a third on disagreement. Every quoted piece of evidence was checked to appear word for word in the source data.</li>
-<li><b>Reporting:</b> Confirmed findings were scored with CVSS 3.1, prioritized by environment exposure, grouped into issue types and correlated into attack chains.</li></ul>
+<p>{cl}'s scanning and testing produced {_plural(len(results), 'raw finding', 'raw findings')}{e(_observed_from(window))}. This assessment triaged them: each was decided from the evidence attached to it, to separate real, exploitable issues from false positives and from questions the evidence cannot answer. No system was tested as part of this work. Phases:</p>
+<ul><li><b>Ingestion:</b> The findings file was parsed as CSV, preserving multiline fields. Every row receives exactly one outcome.</li>
+<li><b>Evidence correlation:</b> Request IDs, code revisions, identities and side-effect boundaries were matched across the requests, responses, logs, traces, source excerpts, manifests and owner comments supplied with each finding.</li>
+<li><b>Automated adjudication with checks:</b> Each finding received two independent automated reviews by an AI model ({e(model)}), with a third when they disagreed. Code then checked that every quoted piece of evidence appears word for word in the source data and applied the evidence gates described under Assessment Method and Limitations.</li>
+<li><b>Reporting:</b> Confirmed findings were scored with CVSS 3.1, prioritized by environment, grouped into distinct issues and correlated into attack chains.</li></ul>
 <h4>Assessment Components</h4>
 <p><b>Evidence-based finding adjudication.</b> Each finding is decided on what the evidence shows about the security boundary, not on the scanner label. Compensating-control claims are treated as claims until shown to exist and to cover the path in question.</p>
 
 <h2 id="severity">Finding Severity Ratings</h2>
-<p>The following table defines levels of severity and the corresponding CVSS v3 score range used throughout this document.</p>
-<table class="grid"><thead><tr><th>Severity</th><th>CVSS v3 Score Range</th><th>Definition</th></tr></thead><tbody>{sev_rows}</tbody></table>
+<p>The following table defines the severity levels and the corresponding CVSS 3.1 score ranges used throughout this document. "Moderate" is used for the CVSS 3.1 "Medium" rating.</p>
+<table class="grid"><thead><tr><th>Severity</th><th>CVSS 3.1 Score Range</th><th>Definition</th></tr></thead><tbody>{sev_rows}</tbody></table>
 
 <h2 id="scope">Scope</h2>
 <table class="grid"><thead><tr><th>Environment</th><th>Systems with findings</th></tr></thead><tbody>{scope_rows}</tbody></table>
 <h4>Scope Exclusions</h4><p>No host was contacted and no new attacks were run. Conclusions rest only on the evidence supplied.</p>
-<h4>Client Allowances</h4><p>{cl} supplied the raw findings with attached evidence: requests, responses, logs, traces, code excerpts, deployment manifests and owner comments. No other access was provided.</p>
+<h4>Client Allowances</h4><p>Input was one findings file ({e(source_name)}, {len(results)} rows) with the evidence attached to each row: requests, responses, logs, traces, code excerpts, deployment manifests and owner comments. No system access was provided or used.</p>
 
 <h2 id="exec">Assessment Summary</h2>
-<p>{e(exec_text)}</p>
+<p>{e(exec_text)}</p>{f"<p class='muted'>{e(date_note)}</p>" if date_note else ""}
 <div class="callout"><b>{e('Production exposure: ' + str(len(prod)) + ' confirmed findings, ' + str(prod_hi) + ' High or Critical.')}</b>
  {f"Findings in the same environment also combine into {_plural(n_conf_chains, 'fully confirmed attack chain', 'fully confirmed attack chains')}, described below." if n_conf_chains else ''}</div>
 
@@ -2911,12 +3575,12 @@ def build_report(results: List[dict], source_name: str, model: str, chains: List
 <p>The following tables describe how confirmed findings in one environment combine, step by step. The evidence does not link them to a single recorded attack, so these show combined exposure, not an incident. A step marked still under review should be settled first.</p>
 {_attack_summary(list(chains), by_id)}
 
-<h3 id="strengths">Security Strengths</h3>
-<p>Not every report was a real weakness. In these areas the evidence shows the protection worked as intended.</p>
+<h3 id="strengths">Security Strengths (Controls Verified in Source Evidence)</h3>
+<p>The largest groups of findings closed as false positives, with one worked example each. In each case the evidence shows the reported condition is absent or unreachable on the deployed path.</p>
 {strengths or "<p class='muted'>None recorded.</p>"}
 
 <h3 id="weaknesses">Security Weaknesses</h3>
-<p>The four highest-priority weaknesses, in order. Each has a full entry under Technical Findings.</p>
+<p>The three highest-priority issues, in order. Each has a full entry under Technical Findings.</p>
 {weak}
 
 <h3 id="impact">Vulnerabilities by Impact</h3>
@@ -2925,11 +3589,11 @@ def build_report(results: List[dict], source_name: str, model: str, chains: List
 <div><h4>By environment</h4>{heat}<h4>By issue type</h4>{type_bars}</div></div>
 
 <h2 id="findings">Technical Findings</h2>
-<h3 id="priority">Top Priority Findings</h3>
-<p>The three confirmed findings with the highest priority. Priority is the CVSS score weighted by how close the system is to production ({e(weights)}).</p>
+<h3 id="priority">Top Priority Issues</h3>
+<p>The three issues to fix first: highest severity, then score, then production exposure. Each links to its full entry below. Per-system fix order is the CVSS score weighted by environment ({e(weights)}).</p>
 {priority_html}
-<h3 id="confirmed">All Confirmed Findings by Issue Type</h3>
-<p>{counts['Confirmed']} confirmed findings in {len(groups)} issue types, ordered by priority. Each entry shows one worked example and lists every system where the issue was confirmed.</p>
+<h3 id="confirmed">All Confirmed Issues</h3>
+<p>{counts['Confirmed']} confirmed findings in {len(issues)} distinct issues, ordered by severity. The numbering (F-01 onward) matches the executive report. Each entry shows one worked example and lists every finding where the issue was confirmed.</p>
 {''.join(issue_html)}
 
 <h2 id="informational">Additional Reports and Scans (Informational)</h2>
@@ -2942,26 +3606,27 @@ def build_report(results: List[dict], source_name: str, model: str, chains: List
 
 <h2 id="method">Assessment Method and Limitations</h2>
 <ul>
-<li><b>Two independent reviews per finding.</b> The second review did not see the first and was set up to challenge both outcomes. {"Where they disagreed, or scored severity far apart, a third review decided; " + _plural(adjudicated, "finding needed", "findings needed") + " this." if adjudicated else "They agreed on every finding, so no tie-break was needed."}</li>
+<li><b>Two independent reviews per finding.</b> The second review did not see the first and was set up to challenge both outcomes. {"Where they disagreed on the outcome or on any CVSS metric, a third review voted; " + _plural(adjudicated, "finding needed", "findings needed") + " this." if adjudicated else "The two reviews reached the same outcome on every finding, so no third review was needed."}</li>
 <li><b>Evidence must be checkable.</b> Confirmed needs at least {MIN_CITATIONS_CONFIRMED} verified citations including runtime evidence, and the deciding step must have been observed. {_plural(evidence_gated, "verdict was", "verdicts were") if evidence_gated else "No verdicts were"} downgraded to Needs Review by these checks.</li>
-<li><b>Consistency check.</b> Findings with the same scenario and evidence must get the same answer. Where reviews still split, the decisive verdicts moved to Needs Review ({_plural(consistency, "finding", "findings")}).</li>
+<li><b>Consistency check.</b> Findings with the same scenario and evidence must get the same answer. Where findings with identical evidence received different verdicts, the decisive ones were moved to Needs Review ({_plural(consistency, "finding", "findings")}).</li>
 <li><b>Claims are not controls.</b> Owner statements, claimed protections and missing log entries are never treated as proof. Source, manifest and runtime records are matched by revision and date before being combined.</li>
 <li><b>Scoring.</b> CVSS 3.1 vectors are chosen from the evidence and scores computed by the published formula. Priority = CVSS &times; environment weight. Fix now is 7.0 or above, Plan a fix 3.0 or above, Backlog below that. Model confidence is reported but does not change the order.</li>
-<li><b>Limits.</b> Assessment uses only the supplied evidence. Reviews were carried out with automated analysis ({e(model)}) under the checks above. {_plural(errors, "finding", "findings") + " could not be reviewed and" if errors else "No findings failed review, and none"} {"is" if errors == 1 else "are"} listed as needs review for that reason.</li></ul>
+<li><b>Limits.</b> Assessment uses only the supplied evidence. Reviews were carried out by AI models (models and call counts: {e(model)}) under the code checks above; a person remains responsible for every outcome. {_plural(errors, "finding", "findings") + " could not be reviewed and" if errors else "No findings failed review, and none"} {"is" if errors == 1 else "are"} listed as needs review for that reason.</li></ul>
 
-<h2 id="appendix" class="noprint">Appendix: Every Finding</h2>
+<h2 id="appendix" class="noprint">Appendix: Every Finding (on-screen only)</h2>
 <div class="noprint"><div class="filters"><input id="q" placeholder="Filter by ID, system, title, reasoning..." aria-label="Filter findings">
 <button data-f="" class="on">All</button><button data-f="Confirmed">Confirmed</button><button data-f="False Positive">False positive</button><button data-f="Needs Review">Needs review</button></div>
 <div class="tablewrap"><table id="all" class="grid"><thead><tr><th>ID</th><th>First seen</th><th>Title</th><th>System</th><th>Env</th><th>Raised by</th><th>Outcome</th><th>Conf.</th><th>Reasoning</th></tr></thead>
 <tbody>{all_rows}</tbody></table></div></div>
-</div><div class="foot">{cl} Technical Assessment Report &middot; Analyst Edition &middot; Business Confidential &middot; Version 1.0</div></div>
+</div><div class="foot">{cl} Technical Assessment Report &middot; Analyst Edition{(" &middot; Prepared by " + e(author)) if author else ""} &middot; Business Confidential &middot; Version 1.0</div></div>
 <script>
 (function(){{var q=document.getElementById('q'),f='',rows=[].slice.call(document.querySelectorAll('#all tbody tr'));
 function apply(){{var t=q.value.toLowerCase();rows.forEach(function(r){{var ok=(!f||r.dataset.cls===f)&&(!t||r.textContent.toLowerCase().indexOf(t)>-1);r.style.display=ok?'':'none';}});}}
 q.addEventListener('input',apply);[].forEach.call(document.querySelectorAll('.filters button'),function(b){{b.addEventListener('click',function(){{
 [].forEach.call(document.querySelectorAll('.filters button'),function(x){{x.classList.remove('on')}});b.classList.add('on');f=b.dataset.f;apply();}});}});
 function openFor(h){{var t=h&&document.getElementById(h.slice(1));var o=t;while(o){{if(o.tagName==='DETAILS')o.open=true;o=o.parentElement;}}if(t)t.scrollIntoView();}}
-window.addEventListener('hashchange',function(){{openFor(location.hash)}});openFor(location.hash);}})();
+window.addEventListener('hashchange',function(){{openFor(location.hash)}});openFor(location.hash);
+window.addEventListener('beforeprint',function(){{[].forEach.call(document.querySelectorAll('details'),function(d){{d.open=true}})}});}})();
 </script></body></html>"""
 
 
@@ -2982,13 +3647,6 @@ def _client_fix(text: object) -> str:
     return out
 
 
-def client_issue_key(r: dict) -> tuple:
-    """One client section per distinct flaw: same issue type and same scored scenario.
-    CVSS vectors are aligned across identical scenarios, so the vector separates
-    two different flaws that share a type (SQL injection in a lookup vs in an update)."""
-    return (issue_key(r), r.get("cvss_vector") or "")
-
-
 # ---------------------------------------------------------------------------
 # Audiences
 # ---------------------------------------------------------------------------
@@ -3007,7 +3665,7 @@ RISK_POSTURE = {  # key: (label, colour variable, one-sentence meaning)
 
 def risk_posture(confirmed: List[dict]) -> str:
     """Posture from the worst confirmed severity in production, in plain rules a reader can check."""
-    prod = {r.get("cvss_severity") for r in confirmed if r["environment"].strip().lower() == "production"}
+    prod = {r.get("cvss_severity") for r in confirmed if env_class(r["environment"]) == "production"}
     for sev, key in (("Critical", "critical"), ("High", "high")):
         if sev in prod:
             return key
@@ -3061,7 +3719,7 @@ def _proof_html(r: dict, row: Optional[Dict[str, str]]) -> str:
         shown = full if len(full) <= PROOF_MAX_CHARS else full[:PROOF_MAX_CHARS] + "\n[... cut for length]"
         body = _highlight(shown, quotes) if shown else "\n\n".join(e(q) for q in quotes)
         points = "".join(f"<li>{prose(c.get('supports', ''))}</li>" for c in cites if c.get("supports"))
-        blocks.append(f"<figure><figcaption>{e(FIELD_LABELS.get(field, field))}</figcaption><pre>{body}</pre></figure>"
+        blocks.append(f"<figure><figcaption>{e(field_label(field))}</figcaption><pre>{body}</pre></figure>"
                       + (f"<ul class='shows'>{points}</ul>" if points else ""))
     facts = [("System", r["asset"]), ("Environment", r["environment"]),
              ("First observed", (r.get("first_observed_utc") or "")[:10]), ("Request ID", (row or {}).get("request_id", ""))]
@@ -3075,37 +3733,38 @@ def _proof_html(r: dict, row: Optional[Dict[str, str]]) -> str:
 def _client_issue(n: int, rows: List[dict], source: Optional[Dict[str, Dict[str, str]]] = None) -> str:
     lead = rows[0]  # highest-priority instance
     sev = lead.get("cvss_severity") or "None"
+    refs = references_html(issue_key(lead))
     proof = [c.get("supports", "") for c in (lead.get("evidence") or []) if c.get("supports")][:3]
     why = ("<p class='why'><b>How it was confirmed.</b> " + " ".join(
         prose(p[:1].upper() + p[1:].rstrip(".") + ".") for p in proof) + "</p>") if proof else ""
-    prod = sum(1 for r in rows if r["environment"].strip().lower() == "production")
+    prod = sum(1 for r in rows if env_class(r["environment"]) == "production")
     inst = "".join(
         f"<tr><td><button type='button' class='idbtn' aria-expanded='false' aria-controls='ev-{e(r['finding_id'])}'>{e(r['finding_id'])}</button></td>"
         f"<td><code>{e(r['asset'])}</code></td>"
         f"<td><span class='env env-{e(r['environment'].strip().lower())}'>{e(r['environment'])}</span></td>"
         f"<td>{e((r.get('first_observed_utc') or '')[:10])}</td><td>{e(TIER_LABEL.get(r.get('priority_tier'), ''))}</td></tr>"
         f"<tr class='evrow' id='ev-{e(r['finding_id'])}' hidden><td colspan='5'>{_proof_html(r, (source or {}).get(r['finding_id']))}</td></tr>"
-        for r in sorted(rows, key=lambda r: (r["environment"].strip().lower() != "production", r["asset"], r["finding_id"])))
+        for r in sorted(rows, key=lambda r: (env_class(r["environment"]) != "production", r["asset"], r["finding_id"])))
     note = ("" if len(rows) == 1 else
             f"<p class='why'>Impact and fix are described from the example on <code>{e(lead['asset'])}</code> ({e(lead['finding_id'])}). "
-            f"The same flaw was confirmed on each system in the table above.</p>")
+            f"The same flaw was confirmed for each finding in the table above.</p>")
     return f"""
 <article class="entry sc-b-{e(sev.lower())}" id="issue-{n}">
   <header><span class="num">{n}</span>
     <div><h3>{e(display_title(lead))}</h3>
-      <div class="sub">{len(rows)} system{'s' if len(rows) != 1 else ''} affected{f', {prod} in production' if prod else ''}</div></div>
+      <div class="sub">{e(_reach(rows))}{f', {_plural(prod, "finding", "findings")} in production' if prod else ''} &middot; Owner: {e(_owners(rows))} &middot; Technical report F-{n:02d}</div></div>
     <div class="score"><span class="sevtag sc-{e(sev.lower())}">{e(SEV_DISPLAY.get(sev, sev))}</span><b>{e(lead.get('cvss_score') if lead.get('cvss_score') is not None else 'n/a')}</b><small>CVSS 3.1</small></div></header>
-  <p class="vec"><code>{e(lead.get('cvss_vector') or 'unscored')}</code></p>
+  <p class="vec"><code>{e(lead.get('cvss_vector') or 'unscored')}</code>{f" <span class='muted'>&middot; {refs}</span>" if refs else ""}</p>
   <div class="cols"><section><h4>Business impact</h4>{_impact_block(lead.get('business_impact'))}{why}</section>
   <section class="fix"><h4>Recommended fix</h4>{_client_fix(lead.get('recommended_fix'))}</section></div>
-  <h4 style="margin-top:12px">Where this was found <span class="muted">(select a finding ID to see the evidence)</span></h4>
-  <table class="where"><thead><tr><th>Finding ID</th><th>Endpoint</th><th>Environment</th><th>First observed</th><th>Fix order</th></tr></thead><tbody>{inst}</tbody></table>
+  <h4 style="margin-top:12px">Where this was found <span class="muted noprint">(select a finding ID to see the evidence)</span><span class="muted printonly">(evidence for each finding ID: technical report F-{n:02d})</span></h4>
+  <table class="where"><thead><tr><th>Finding ID</th><th>System</th><th>Environment</th><th>Scanner first observed</th><th>Fix order</th></tr></thead><tbody>{inst}</tbody></table>
   {note}
 </article>"""
 
 
 def build_client_report(results: List[dict], source_name: str, chains: List[dict] = (), client: str = "Client",
-                        source_rows: Optional[Dict[str, Dict[str, str]]] = None) -> str:
+                        source_rows: Optional[Dict[str, Dict[str, str]]] = None, company: str = "", tester: str = "") -> str:
     """Render the executive report for leadership and risk owners.
 
     It carries confirmed findings only, in business terms: a risk posture, what leadership needs to know, decisions
@@ -3118,36 +3777,31 @@ def build_client_report(results: List[dict], source_name: str, chains: List[dict
         client: Client name shown in headings.
         source_rows: The input rows by finding_id, so evidence can be shown in full. Without them only the quoted
             lines are shown.
+        company: The reporting company (shown as author when given).
+        tester: The assessor's name (shown as author when given).
 
     Returns:
         A self-contained HTML page.
     """
     cl = e(client)
+    author = prepared_by(company, tester)
     confirmed = sorted((r for r in results if r["classification"] == "Confirmed"), key=_priority_key)
     sev = collections.Counter(r.get("cvss_severity") for r in confirmed)
-    prod = [r for r in confirmed if r["environment"].strip().lower() == "production"]
+    prod = [r for r in confirmed if env_class(r["environment"]) == "production"]
     prod_hi = sum(1 for r in prod if r.get("cvss_severity") in ("Critical", "High"))
     n_fp = sum(1 for r in results if r["classification"] == "False Positive")
     n_nr = sum(1 for r in results if r["classification"] == "Needs Review")
-    by_issue: Dict[tuple, List[dict]] = {}
-    for r in confirmed:
-        by_issue.setdefault(client_issue_key(r), []).append(r)
-
-    def order(rows: List[dict]) -> tuple:  # worst severity first, then production exposure, then reach
-        lead = rows[0]
-        return (SEV_ORDER.get(lead.get("cvss_severity"), 5), -(lead.get("cvss_score") or 0),
-                -sum(1 for r in rows if r["environment"].strip().lower() == "production"), -len(rows), lead["finding_id"])
-    issues = sorted(by_issue.values(), key=order)
+    issues = issue_groups(confirmed)
     number = {id(rows): i for i, rows in enumerate(issues, 1)}
-    seen = sorted(r.get("first_observed_utc", "")[:10] for r in results if r.get("first_observed_utc"))
-    window = _date_window(seen, "the review period")
+    window, date_note = _observed(confirmed)
+    report_date = _fmt_date(dt.date.today())
     def best_tier(rows: List[dict]) -> str:
         """The most urgent fix tier among an issue's findings."""
         return min((r.get("priority_tier") or "NOTE" for r in rows), key={"CHASE": 0, "LOOK": 1, "NOTE": 2}.get)
 
     index_rows = "".join(
         f"<tr><td>{number[id(rows)]}</td><td><a href='#issue-{number[id(rows)]}'>{e(display_title(rows[0]))}</a></td>"
-        f"{_sev_cell(rows[0].get('cvss_severity'))}<td class='n'>{e(rows[0].get('cvss_score'))}</td><td class='n'>{len(rows)}</td>"
+        f"{_sev_cell(rows[0].get('cvss_severity'))}<td class='n'>{e(rows[0].get('cvss_score'))}</td><td class='n'>{len(rows)}</td><td class='n'>{_systems(rows)}</td>"
         f"<td>{_env_chips(rows)}</td><td>{e(TIER_LABEL.get(best_tier(rows), ''))}</td></tr>" for rows in issues)
     body = ""
     for band, label in (("Critical", "Critical"), ("High", "High"), ("Medium", "Moderate"), ("Low", "Low")):
@@ -3159,13 +3813,13 @@ def build_client_report(results: List[dict], source_name: str, chains: List[dict
                      + "".join(_client_issue(number[id(rows)], rows, source_rows) for rows in rows_b))
     first = "".join(
         f"<li><b><a href='#issue-{number[id(rows)]}'>{e(display_title(rows[0]))}</a></b> "
-        f"<span class='muted'>({len(rows)} system{'s' if len(rows) != 1 else ''}, CVSS {e(rows[0].get('cvss_score'))})</span><br>"
+        f"<span class='muted'>({e(_reach(rows))}, CVSS {e(rows[0].get('cvss_score'))})</span><br>"
         f"{prose(_trim((split_fix(rows[0].get('recommended_fix'))[0] or [''])[0], 230))}</li>" for rows in issues[:3])
     sev_bars = _bar_rows([(SEV_DISPLAY.get(s, s), sum(1 for rows in issues if rows[0].get('cvss_severity') == s), SEV_COLOR[s], "")
                           for s in ("Critical", "High", "Medium", "Low")], max(1, len(issues)))
     heat = _heatmap(confirmed).replace(">Medium<", ">Moderate<")
     sev_rows = "".join(f"<tr><td class='sevcell sc-{n.lower() if n != 'Moderate' else 'medium'}'>{n}</td><td>{rng}</td><td>{d}</td></tr>" for n, rng, d in SEV_DEFS[:4])
-    prod_issues = sum(1 for rows in issues if any(r["environment"].strip().lower() == "production" for r in rows))
+    prod_issues = sum(1 for rows in issues if any(env_class(r["environment"]) == "production" for r in rows))
     prod_systems = len({r["asset"] for r in prod})
     lead_in = (f"Every one of the {len(issues)} issues is" if prod_issues == len(issues) else f"{prod_issues} of the {len(issues)} issues are")
     headline = (f"{lead_in} present in production: {len(prod)} findings on {prod_systems} production "
@@ -3188,14 +3842,14 @@ def build_client_report(results: List[dict], source_name: str, chains: List[dict
     owners = sorted({r.get("asset_owner") for r in confirmed if r.get("asset_owner")})
     asks = ([f"Approve immediate work on the {n_now} issue{'s' if n_now != 1 else ''} marked Fix now."] if n_now else []) + (
         [f"Confirm an owner for every issue. Teams named in the records: {e(', '.join(owners))}."] if owners else []) + (
-        [f"Fund the {n_nr} follow-up test{'s' if n_nr != 1 else ''} that would settle the findings the evidence could not decide."] if n_nr else []) + [
+        [f"Schedule follow-up testing for the {n_nr} finding{'s' if n_nr != 1 else ''} the evidence could not decide. The technical report names the test that would settle each one."] if n_nr else []) + [
         "Schedule a retest once the fixes ship, to confirm each one holds."]
     decisions = "".join(f"<li>{d}</li>" for d in asks)
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{cl} Executive Security Report</title>
 {FONT_LINKS}<style>{REPORT_BASE_CSS}{CLIENT_CSS}</style></head><body><div class="doc">
-{_cover(cl, "Executive Security Report", [("Edition", "Executive, for leadership and risk owners"), ("Classification", "Confidential"), ("Evidence period", window)], "Executive edition")}
+{_cover(cl, "Executive Security Report", [("Edition", "Executive, for leadership and risk owners"), ("Prepared for", client)] + ([("Prepared by", author)] if author else []) + [("Classification", "Business Confidential"), ("Report date", report_date), ("Findings observed", window or "Not recorded in the source data"), ("Source data", source_name), ("Version", "1.0")], "Executive edition")}
 <div class="page">
 <h2 style="break-before:auto">Executive brief</h2>
 <div class="posture" style="--c:var({posture_color})"><span class="plabel">Risk posture</span><b>{e(posture_label)}</b><p>{e(posture_text)}</p></div>
@@ -3209,21 +3863,73 @@ def build_client_report(results: List[dict], source_name: str, chains: List[dict
 
 <h2>About these numbers</h2>
 <p>Your security tooling raised {len(results)} findings. Each was checked against the evidence behind it, and <b>{len(confirmed)}</b> are confirmed real.
-Where the same flaw appears on several systems it is reported once, with every affected endpoint and finding ID listed under it. The {len(confirmed)} findings are therefore
-<b>{len(issues)} distinct issues</b>. A <i>finding</i> is one flaw on one system. An <i>issue</i> is the same flaw wherever it occurs.</p>
+Where the same flaw was reported more than once it is described once, with every affected system and finding ID listed under it. The {len(confirmed)} findings are therefore
+<b>{len(issues)} distinct issues</b>. A <i>finding</i> is one scanner record; some systems carry several records of the same flaw. An <i>issue</i> is the same flaw wherever it occurs.</p>
+<p>This report triages findings that {cl}'s tooling had already raised, using the evidence recorded with each one. It is not a penetration test: no system was tested for this report, and nothing here goes beyond what that evidence shows.{(" " + e(date_note)) if date_note else ""}</p>
 <p>The other {len(results) - len(confirmed)} findings are not in this report. {n_fp} were checked and are not exploitable as reported, so no action is needed. {n_nr} could not be decided from the evidence supplied: they are neither confirmed nor ruled out, and each needs one specific follow-up test before it can be settled.</p>
 <div class="twocol"><div><h4>Findings by environment and severity</h4>{heat}</div><div><h4>Distinct issues by severity</h4>{sev_bars}</div></div>
 
 <h2 id="index">All issues at a glance</h2>
-<table><thead><tr><th>#</th><th>Issue</th><th>Severity</th><th>CVSS</th><th>Systems</th><th>Environments</th><th>Fix order</th></tr></thead><tbody>{index_rows}</tbody></table>
-<h4 style="margin-top:14px">How severity is rated (CVSS 3.1)</h4><table><thead><tr><th>Severity</th><th>Score</th><th>What it means</th></tr></thead><tbody>{sev_rows}</tbody></table>
-<p class="muted">Issues are ordered by severity, then by how many production systems are affected, then by how many systems in total. Fix order combines the CVSS score with how close the system is to production (production counts fully, disaster-recovery next, then staging, then sandbox); it is shown for each affected system.</p>
+<table><thead><tr><th>#</th><th>Issue</th><th>Severity</th><th>CVSS</th><th>Findings</th><th>Systems</th><th>Environments</th><th>Fix order</th></tr></thead><tbody>{index_rows}</tbody></table>
+<h4 style="margin-top:14px">How severity is rated (CVSS 3.1; "Moderate" is the CVSS "Medium" rating)</h4><table><thead><tr><th>Severity</th><th>Score</th><th>What it means</th></tr></thead><tbody>{sev_rows}</tbody></table>
+<p class="muted">Issues are ordered by severity, then score, then how many findings are in production, then how many findings in total. Issue numbers match the F-numbers in the technical report. Fix order combines the CVSS score with how close the system is to production (production counts fully, disaster-recovery next, then staging, then sandbox); it is shown for each affected system.</p>
 {body}
 <h2>About this report</h2>
-<p>This is a snapshot in time based on the evidence gathered with each finding, from {e(window)}. No new testing was run against any system for this report. The {n_fp} findings shown not to be exploitable and the {n_nr} that need more evidence are not listed here. Repeat the review after fixes ship to confirm that the controls hold.</p>
-</div><div class="foot">{cl} Executive Security Report &middot; Confidential</div></div>
+<p>This is a snapshot in time based on the evidence recorded with each confirmed finding{e(_observed_from(window))}. No new testing was run against any system for this report.{(" Prepared by " + e(author) + " for " + cl + ".") if author else ""} The {n_fp} findings shown not to be exploitable and the {n_nr} that need more evidence are not listed here. Repeat the review after fixes ship to confirm that the controls hold.</p>
+</div><div class="foot">{cl} Executive Security Report{(" &middot; Prepared by " + e(author)) if author else ""} &middot; Business Confidential &middot; Version 1.0 &middot; {e(report_date)}</div></div>
 <noscript><style>.evrow[hidden]{{display:table-row}}</style></noscript>
 <script>{PROOF_JS}</script></body></html>"""
+
+
+def _md(text: object) -> str:
+    """One line of prose for Markdown (pipes are escaped only where a table needs it)."""
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def build_client_markdown(results: List[dict], source_name: str, client: str = "Client", company: str = "", tester: str = "") -> str:
+    """The client report as Markdown: the three highest-priority issues first, then every other confirmed issue.
+    Each carries title, affected assets, CVSS 3.1 vector and score, impact, fix and the verbatim evidence quotes."""
+    confirmed = [r for r in results if r["classification"] == "Confirmed"]
+    issues = issue_groups(confirmed)
+    window, date_note = _observed(confirmed)
+    counts = collections.Counter(r["classification"] for r in results)
+    author = prepared_by(company, tester)
+    out = [f"# {client}: Confirmed Security Findings", "",
+           f"Prepared for {client}" + (f" by {author}" if author else ""), "",
+           f"Business Confidential · Version 1.0 · Report date {_fmt_date(dt.date.today())} · Source data: {source_name}", "",
+           "## Summary", "",
+           f"{_plural(len(results), 'scanner finding was', 'scanner findings were')} triaged against the evidence recorded with "
+           f"each one: {counts['Confirmed']} confirmed, {counts['False Positive']} false positive{'s' if counts['False Positive'] != 1 else ''} "
+           f"and {counts['Needs Review']} needing more evidence before {'it' if counts['Needs Review'] == 1 else 'they'} can be decided. "
+           f"The confirmed findings are {_plural(len(issues), 'distinct issue', 'distinct issues')}{_observed_from(window)}. This is a triage of "
+           f"existing findings, not a penetration test; no system was tested for this report." + (f" {date_note}" if date_note else ""), "",
+           "| # | Issue | Severity | CVSS | Findings | Systems |", "|---|---|---|---|---|---|"]
+    for i, g in enumerate(issues, 1):
+        sev = g[0].get("cvss_severity")
+        out.append(f"| F-{i:02d} | {_md(display_title(g[0])).replace('|', chr(92) + '|')} | {SEV_DISPLAY.get(sev, sev)} | {g[0].get('cvss_score')} | {len(g)} | {_systems(g)} |")
+    for i, g in enumerate(issues, 1):
+        if i == 1:
+            out += ["", "## Top 3 priority issues"]
+        elif i == 4:
+            out += ["", "## All other confirmed issues"]
+        lead, sev = g[0], g[0].get("cvss_severity")
+        steps, harden, verify = split_fix(lead.get("recommended_fix"))
+        refs = re.sub(r"<[^>]+>", "", references_html(issue_key(lead)))
+        out += ["", f"### F-{i:02d} {_md(display_title(lead))} ({SEV_DISPLAY.get(sev, sev)})", "",
+                f"- **CVSS 3.1:** {lead.get('cvss_score')} `{lead.get('cvss_vector')}`",
+                f"- **Affected ({_reach(g)}):** " + "; ".join(f"`{r['asset']}` ({r['environment']}, {r['finding_id']})" for r in g),
+                f"- **Owner:** {_owners(g)}"] + ([f"- **References:** {html.unescape(refs)}"] if refs else []) + [
+                "", "**Impact.** " + _md(lead.get("business_impact")), "", "**Recommended fix.**", ""]
+        out += [f"{n}. {_md(s)}" for n, s in enumerate(steps + harden, 1)]
+        if verify:
+            out += ["", "**How to check the fix worked.** " + _md(" ".join(verify))]
+        out += ["", f"**Evidence** (verbatim from the source record for {lead['finding_id']}):", ""]
+        for c in (lead.get("evidence") or [])[:4]:
+            out.append(f"- {field_label(c['field'])}: `{_md(_trim(c['quote'], 300)).replace('`', '')}`"
+                       + (f" ({_md(c.get('supports'))})" if c.get("supports") else ""))
+        if len(g) > 1:
+            out += ["", f"Impact and fix are described from {lead['finding_id']}; the same flaw was confirmed for every finding listed above."]
+    return "\n".join(out) + "\n"
 
 
 # ============================================================================
@@ -3258,7 +3964,30 @@ def choose_csv() -> Path:
         print(f"  not a .csv file: {ans!r}")
 
 
-def rebuild_reports(out: Path, source_name: str, source_csv: Optional[Path] = None, client: Optional[str] = None) -> int:
+def ask(label: str, given: Optional[str], default: str = "") -> str:
+    """A value from the command line, else asked for interactively, else the default (non-interactive runs)."""
+    if given is not None:
+        return given.strip()
+    if not sys.stdin.isatty():
+        return default
+    try:
+        ans = input(f"{label}{f' [{default}]' if default else ' (Enter to leave out)'}: ").strip()
+    except EOFError:
+        return default
+    return ans or default
+
+
+def report_parties(args: argparse.Namespace, saved: Optional[dict] = None) -> Tuple[str, str, str]:
+    """Client company, reporting company and assessor name for the reports. Flags win, then prompts; a rebuild
+    offers the values saved with the run as defaults. Blank author fields are left out of the reports."""
+    saved = saved or {}
+    return (ask("Client company name", args.client_name, saved.get("client_name") or "Client") or "Client",
+            ask("Reporting company name", args.company, saved.get("reporting_company", "")),
+            ask("Pentester / assessor name", args.tester, saved.get("assessor_name", "")))
+
+
+def rebuild_reports(out: Path, source_name: str, source_csv: Optional[Path] = None,
+                    parties: Optional[Callable[[dict], Tuple[str, str, str]]] = None) -> int:
     """Regenerate both HTML reports from saved results. No model calls."""
     try:
         results = [json.loads(line) for line in (out / "assessments.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -3268,30 +3997,41 @@ def rebuild_reports(out: Path, source_name: str, source_csv: Optional[Path] = No
         print(f"error: cannot rebuild reports from {out}: {exc}", file=sys.stderr)
         return 2
     for r in results:  # fix order is derived from the saved CVSS score, so a policy change needs no model calls
+        polish_result(r)  # re-apply the current editorial rules to saved prose (idempotent)
         if r["classification"] == "Confirmed":
             r["priority_score"], r["priority_tier"] = priority(r.get("cvss_score"), r["environment"])
     write_classified(out / "classified_findings.csv", results)
     (out / "assessments.jsonl").write_text("".join(json.dumps(r, default=str) + "\n" for r in results), encoding="utf-8")
     used = summary.get("model_calls_answered") or {}
     model_desc = ", ".join(f"{m} ({n} calls)" for m, n in used.items()) or ", ".join(summary.get("model_chain", []))
-    name = client or summary.get("client_name") or "Client"
+    name, company, tester = parties(summary) if parties else (summary.get("client_name") or "Client",
+                                                               summary.get("reporting_company", ""), summary.get("assessor_name", ""))
+    summary.update(client_name=name, reporting_company=company, assessor_name=tester)
+    (out / "run_summary.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
     source_rows: Optional[Dict[str, Dict[str, str]]] = None
     if source_csv:
         try:
-            source_rows = {r["finding_id"]: r for r in read_findings(source_csv)}
+            saved = out / "column_map.json"
+            mapping = json.loads(saved.read_text(encoding="utf-8")) if saved.exists() else None
+            source_rows = {r["finding_id"]: r for r in read_findings(source_csv, mapping=mapping)}
         except (OSError, InputError) as exc:
             print(f"warning: the client report will show quoted lines only; could not read {source_csv}: {exc}", file=sys.stderr)
-    analyst = build_report(results, source_name, model_desc, chains, name)
-    client_page = build_client_report(results, source_name, chains, name, source_rows)
+    for r in results:  # results saved before last_observed_utc was recorded
+        if not r.get("last_observed_utc") and source_rows and r["finding_id"] in source_rows:
+            r["last_observed_utc"] = source_rows[r["finding_id"]].get("last_observed_utc", "")
+    analyst = build_report(results, source_name, model_desc, chains, name, company, tester)
+    client_page = build_client_report(results, source_name, chains, name, source_rows, company, tester)
     (out / "findings_report.html").write_text(analyst, encoding="utf-8")
     (out / "client_report.html").write_text(client_page, encoding="utf-8")
+    (out / "client_report.md").write_text(build_client_markdown(results, source_name, name, company, tester), encoding="utf-8")
     leftover = report_style_issues(analyst) + report_style_issues(client_page)
     if leftover:
         print(f"WARNING: report prose still contains: {', '.join(sorted(set(leftover)))}", file=sys.stderr)
-    print(f"Rebuilt {out}/findings_report.html and {out}/client_report.html from {len(results)} saved assessments")
+    print(f"Rebuilt {out}/findings_report.html, client_report.html and client_report.md from {len(results)} saved assessments")
     if source_csv and source_csv.exists():
         try:
-            n = write_filled_input(out / f"{source_csv.stem}-filled.csv", source_csv, results)
+            n = write_filled_input(out / f"{source_csv.stem}-filled.csv", source_csv, results,
+                                   list(source_rows.values()) if source_rows else None)
             print(f"Rebuilt {out}/{source_csv.stem}-filled.csv ({n} rows filled)")
         except (InputError, OSError) as exc:
             print(f"warning: could not rebuild the filled input CSV: {exc}", file=sys.stderr)
@@ -3313,8 +4053,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--limit", type=int, help="only assess the first N findings")
     ap.add_argument("--ids", help="comma-separated finding_ids to assess")
     ap.add_argument("--claude-bin", default="claude")
-    ap.add_argument("--client-name", help="name shown in the report headings (default: Client)")
+    ap.add_argument("--client-name", help="client company name for the reports (prompted if omitted; default: Client)")
+    ap.add_argument("--company", help="reporting company name (prompted if omitted; '' to leave out)")
+    ap.add_argument("--tester", help="pentester / assessor name (prompted if omitted; '' to leave out)")
     ap.add_argument("--no-cache", action="store_true", help="ignore cached model responses")
+    ap.add_argument("--skip-fact-check", action="store_true", help="do not fact-check the client-facing text")
+    ap.add_argument("--column-map", type=Path, help="JSON object mapping source columns to roles; overrides the inferred mapping")
     ap.add_argument("--rebuild-reports", action="store_true",
                     help="rebuild both HTML reports from the saved out/assessments.jsonl; no model calls")
     ap.add_argument("--self-test", action="store_true", help="run the built-in test suite and exit")
@@ -3336,16 +4080,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0 if result.wasSuccessful() else 1
 
     if args.rebuild_reports:
-        return rebuild_reports(args.out, args.csv.name if args.csv else "findings CSV", args.csv, args.client_name)
+        return rebuild_reports(args.out, args.csv.name if args.csv else "findings CSV", args.csv,
+                               lambda saved: report_parties(args, saved))
 
     csv_path = args.csv or choose_csv()
+    models = [args.model] + [m.strip() for m in (args.fallback_model or "").split(",") if m.strip() and m.strip() != args.model]
+    llm = ClaudeCLI(models, effort=args.effort or None, binary=args.claude_bin, timeout=args.timeout,
+                    cache_dir=None if args.no_cache else HERE / ".cache")
     try:
-        rows = read_findings(csv_path)
-        context = dataset_context(rows)  # computed over the whole file, before any --ids/--limit filter
-        rows.sort(key=time_sort_key)     # process and report in chronological order
-    except (InputError, OSError) as exc:
+        llm.check_available()
+    except LLMError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    try:
+        override = json.loads(args.column_map.read_text(encoding="utf-8")) if args.column_map else None
+        if override is not None and not (isinstance(override, dict) and all(isinstance(v, str) for v in override.values())):
+            raise InputError(f"{args.column_map}: expected a JSON object of source column -> role")
+        rows = read_findings(csv_path, llm=llm, override=override)
+        mapping = read_findings.last_mapping  # type: ignore[attr-defined]
+        all_rows = list(rows)
+        context = dataset_context(rows)  # computed over the whole file, before any --ids/--limit filter
+        rows.sort(key=time_sort_key)     # process and report in chronological order
+    except (InputError, OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print("Column mapping (source column -> role):")
+    for src, dst in mapping.items():
+        print(f"  {src!r:<34} -> {dst}")
     if args.ids:
         want = {i.strip() for i in args.ids.split(",") if i.strip()}
         unknown = want - {r["finding_id"] for r in rows}
@@ -3357,17 +4118,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not rows:
         print("error: no findings selected", file=sys.stderr)
         return 2
+    client, company, tester = report_parties(args)  # asked before the long run, not after it
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
 
-    models = [args.model] + [m.strip() for m in (args.fallback_model or "").split(",") if m.strip() and m.strip() != args.model]
-    llm = ClaudeCLI(models, effort=args.effort or None, binary=args.claude_bin, timeout=args.timeout,
-                    cache_dir=None if args.no_cache else HERE / ".cache")
-    try:
-        llm.check_available()
-    except LLMError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
 
     print(f"Assessing {len(rows)} findings from {csv_path.name} with {llm.model} ({args.workers} workers)")
     t0 = time.time()
@@ -3397,10 +4151,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for c in chains:
         print(f"[chain] {c['chain_id']} ({c['status']}): " + " -> ".join(
             "/".join(f["finding_id"] for f in st["findings"]) for st in c["stages"]))
+    facts_log: List[dict] = []
+    if not args.skip_fact_check:
+        facts_log = fact_check(results, {r["finding_id"]: r for r in rows}, llm)
+        for f in facts_log:
+            bad = [c["claim"] for c in f["claims"] if c["status"] == "unsupported"]
+            print(f"[fact-check] {f['finding_id']} {f['status']}" + (f": {'; '.join(bad)[:200]}" if bad else "")
+                  + (f" ({f['error'][:120]})" if f.get("error") else ""))
+        (out / "fact_check.json").write_text(json.dumps(facts_log, indent=1), encoding="utf-8")
     # Outputs are written only after the consistency gate and chain correlation have run.
     write_classified(out / "classified_findings.csv", results)
     filled_path = out / f"{csv_path.stem}-filled.csv"
-    n_filled = write_filled_input(filled_path, csv_path, results)
+    n_filled = write_filled_input(filled_path, csv_path, results, all_rows)
+    (out / "column_map.json").write_text(json.dumps(mapping, indent=1), encoding="utf-8")
     print(f"Filled candidate_classification and candidate_reasoning for {n_filled} rows in {filled_path}")
     with open(out / "assessments.jsonl", "w", encoding="utf-8") as fh:
         for r in results:
@@ -3411,34 +4174,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     audit["harmonised"] = harmonised
     (out / "audit.json").write_text(json.dumps(audit, indent=1, default=str), encoding="utf-8")
     errors = sum(1 for r in results if r.get("error"))
-    stats = {"client_name": args.client_name or "Client", "agents": AGENTS, "model_chain": llm.models, "model_calls_answered": used, "models_disabled": llm.disabled,
+    stats = {"client_name": client, "reporting_company": company, "assessor_name": tester, "agents": AGENTS, "model_chain": llm.models, "model_calls_answered": used, "models_disabled": llm.disabled,
              "effort": args.effort, "findings": len(results),
              "counts": dict(collections.Counter(r["classification"] for r in results)),
              "llm_calls": llm.stats.calls, "cache_hits": llm.stats.cache_hits, "failures": llm.stats.failures, "rows_failed": errors,
              "cost_usd_this_run": round(llm.stats.cost_usd, 2), "elapsed_s": round(time.time() - t0, 1),
-             "consistency_audit": {k: audit[k] for k in ("scenario_groups", "split_groups", "minority_rows")}}
+             "consistency_audit": {k: audit[k] for k in ("scenario_groups", "split_groups", "minority_rows")},
+             "fact_check": dict(collections.Counter(f["status"] for f in facts_log)) if facts_log else "skipped"}
     (out / "run_summary.json").write_text(json.dumps(stats, indent=1), encoding="utf-8")
-    page = build_report(results, csv_path.name, model_desc, chains, args.client_name or "Client")
+    page = build_report(results, csv_path.name, model_desc, chains, client, company, tester)
     (out / "findings_report.html").write_text(page, encoding="utf-8")
-    client_page = build_client_report(results, csv_path.name, chains, args.client_name or "Client", {r["finding_id"]: r for r in rows})
+    client_page = build_client_report(results, csv_path.name, chains, client, {r["finding_id"]: r for r in rows}, company, tester)
     (out / "client_report.html").write_text(client_page, encoding="utf-8")
-    leftover = report_style_issues(page)
+    (out / "client_report.md").write_text(build_client_markdown(results, csv_path.name, client, company, tester), encoding="utf-8")
+    leftover = report_style_issues(page) + report_style_issues(client_page)
     audit["report_style_issues"] = leftover
     (out / "audit.json").write_text(json.dumps(audit, indent=1, default=str), encoding="utf-8")
     if leftover:
         print(f"WARNING: report prose still contains: {', '.join(leftover)}", file=sys.stderr)
     print(json.dumps(stats, indent=1))
-    print(f"Wrote {out}/: classified_findings.csv, findings_report.html, client_report.html, assessments.jsonl, attack_chains.json, audit.json, run_summary.json")
+    print(f"Wrote {out}/: classified_findings.csv, findings_report.html, client_report.html, client_report.md, assessments.jsonl, attack_chains.json, audit.json, run_summary.json")
     for m, why in llm.disabled.items():
         print(f"NOTICE: {m} was unavailable ({why[:120]}); fallback model(s) answered instead - see run_summary.json",
               file=sys.stderr)
+    flagged = [f["finding_id"] for f in facts_log if f["status"] == "flagged"]
+    if flagged:
+        print(f"WARNING: client-facing text for {len(flagged)} issue(s) still has claims the evidence does not support "
+              f"({', '.join(flagged)}). Fix them before sending; see fact_check.json and the analyst report.", file=sys.stderr)
     if errors:
         print(f"WARNING: {errors} finding(s) could not be assessed and were routed to Needs Review. "
               f"Re-run the same command to retry them (successful calls are cached).", file=sys.stderr)
         return 3
     return 0
-
-
 
 
 # ============================================================================
@@ -3655,10 +4422,12 @@ class TestReviewRegressions(unittest.TestCase):
             out = assess_row(r, FakeLLM(lambda s, m, a=a: a))
             out.update(classification="Confirmed", confidence=c, gate_notes="")
             out["cvss_vector"], out["cvss_score"], out["cvss_severity"] = score_vector(v)
+            out["cvss_rationale"] = f"AV:{v.split('AV:')[1][0]} because ..."
             res.append(out)
         harmonise(twins, res)
         self.assertEqual({r["cvss_vector"] for r in res}, {vecs[0]})
         self.assertEqual(res[2]["cvss_vector_original"], vecs[2])
+        self.assertEqual(res[2]["cvss_rationale"], "AV:N because ...")   # the rationale travels with the vector
         self.assertEqual({r["confidence"] for r in res}, {0.8})
 
     def test_plain_text_leaves_row_level_security_alone(self):
@@ -3730,6 +4499,31 @@ class TestConsensus(unittest.TestCase):
         self.assertLessEqual(res["confidence"], ADJUDICATED_CONFIDENCE_CAP)
         self.assertTrue(res["assessor_agreement"].startswith("adjudicated"))
 
+    def test_cvss_tiebreak_is_per_metric_median_and_order_independent(self):
+        def rv(vec, title):
+            return {"classification": "Confirmed", "report": {"cvss_vector": vec, "client_title": title,
+                                                              "cvss_rationale": "r.", "business_impact": "", "recommended_fix": ""}}
+        hi = rv("CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N", "hi")   # 8.1
+        lo = rv("CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:N", "lo")   # 6.5
+        two, note = tiebreak_vector([hi, lo])
+        self.assertEqual(two["cvss_vector"], lo["report"]["cvss_vector"])  # two reviews: the less severe value
+        self.assertIn("C (H vs N; scored N)", note)
+        self.assertEqual(tiebreak_vector([lo, hi])[0], two)                 # order does not matter
+        three, _ = tiebreak_vector([hi, lo, rv(hi["report"]["cvss_vector"], "adj")])
+        self.assertEqual(three["cvss_vector"], hi["report"]["cvss_vector"])  # two of three agree: their value
+        same, note2 = tiebreak_vector([hi, rv(hi["report"]["cvss_vector"], "b")])
+        self.assertEqual((same["cvss_vector"], note2), (hi["report"]["cvss_vector"], ""))
+        self.assertEqual(tiebreak_vector([{"classification": "Confirmed", "report": {"cvss_vector": "junk"}}]), (None, ""))
+
+    def test_scores_in_different_severity_bands_are_adjudicated(self):
+        conf = {"classification": "Confirmed"}
+        high = dict(conf, report={"cvss_vector": "CVSS:3.1/AV:A/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"})      # 8.1 High
+        critical = dict(conf, report={"cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"})  # 9.1 Critical
+        self.assertIn("severity band", needs_adjudication(high, critical) or "")
+        self.assertIsNone(needs_adjudication(high, dict(high)))
+        same_band = dict(conf, report={"cvss_vector": "CVSS:3.1/AV:A/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:L"})  # 8.3 High
+        self.assertIn("A A=N B=L", needs_adjudication(high, same_band) or "")  # any metric split gets a third vote
+
     def test_llm_failure_routes_to_needs_review(self):
         llm = self._llm({"classify": LLMError("boom"), "verify": LLMError("boom")})
         res = assess_row(_test_row(), llm)
@@ -3744,7 +4538,6 @@ class TestConsensus(unittest.TestCase):
         self.assertEqual(res["confidence"], 0.8)        # lower of the two assessors
         self.assertEqual(res["priority_tier"], "LOOK")  # 6.5 * 1.0 = 6.5, below the 7.0 Fix-now line
         self.assertEqual(res["priority_score"], 6.5)    # confidence does not enter the score
-
 
 
 class TestGuidedChecklist(unittest.TestCase):
@@ -3828,13 +4621,13 @@ class TestGuidedChecklist(unittest.TestCase):
 
 class TestReviewFixes(unittest.TestCase):
     def test_filled_input_csv_keeps_every_column_and_fills_the_two_answer_columns(self):
-        import tempfile
         with tempfile.TemporaryDirectory() as d:
             src, dst = Path(d) / "in.csv", Path(d) / "out.csv"
             src.write_text("finding_id,asset,candidate_classification,candidate_reasoning\n"
                            'A-1,"a,b\nc",,\nA-2,x,,\n', encoding="utf-8")
             n = write_filled_input(dst, src, [{"finding_id": "A-1", "classification": "Confirmed", "reasoning": "=bad"}])
-            rows = list(csv.DictReader(open(dst, newline="", encoding="utf-8")))
+            with open(dst, newline="", encoding="utf-8") as fh:
+                rows = list(csv.DictReader(fh))
             self.assertEqual(n, 1)
             self.assertEqual(rows[0]["asset"], "a,b\nc")            # raw field untouched, newline and comma kept
             self.assertEqual(rows[0]["candidate_classification"], "Confirmed")
@@ -3857,6 +4650,9 @@ class TestReviewFixes(unittest.TestCase):
         self.assertNotIn(" ,", t)
         self.assertEqual(_date_window(["N/A", "2026-07-01", "2026-10-11"]), "July 1, 2026 to October 11, 2026")
         self.assertEqual(_date_window(["N/A"]), "the observation period")
+        self.assertEqual(_observed([{"first_observed_utc": "N/A"}])[0], "")   # no dates: nothing claimed
+        self.assertEqual(plain_text("Done. The packet does not show it."), "Done. The evidence does not show it.")
+        self.assertEqual(plain_text("Two accounts. the evidence ends, e.g. here. eval(x) stays."), "Two accounts. The evidence ends, e.g. here. eval(x) stays.")
 
     def test_truncated_or_malformed_csv_is_rejected(self):
         import tempfile
@@ -3973,6 +4769,151 @@ class TestFactsAndReport(unittest.TestCase):
             self.assertTrue(0 <= float(out[0]["confidence"]) <= 1)
 
 
+class TestAnyCSV(unittest.TestCase):
+    """Any delimited file, any column names, any data: the pipeline maps it and still produces valid reports."""
+
+    HEADERS = ["Host", "Plugin Name", "Risk", "Plugin Output", "Analyst Notes", "Status", "Env", "Discovered"]
+    DATA = [["10.0.0.5", "SQL Injection in /search", "High",
+             'GET /search?q=1%27%20OR%201=1--\nHTTP/1.1 200 OK\n{"rows": 4021, "note": "all customers returned"}',
+             "Dev team says WAF blocks this; not verified", "Open", "prod", "03/15/2026 14:02"],
+            ["10.0.0.9", "Missing HSTS header", "Low", "Strict-Transport-Security header not present", "Caf\u00e9 team owns this",
+             "Open", "staging", "2026-03-16"],
+            ["10.0.0.5", "Outdated jQuery 1.8", "Medium", "", "Version string seen only", "Accepted risk", "prod", "1773700000"]]
+
+    def _write(self, d: str, delimiter: str = ";", encoding: str = "cp1252") -> Path:
+        path = Path(d) / "export.csv"
+        with open(path, "w", newline="", encoding=encoding) as fh:
+            csv.writer(fh, delimiter=delimiter).writerows([self.HEADERS] + self.DATA)
+        return path
+
+    def test_scanner_export_is_mapped_without_a_model(self):
+        with tempfile.TemporaryDirectory() as d:
+            rows = read_findings(self._write(d))
+        m = read_findings.last_mapping
+        self.assertEqual((m["Host"], m["Plugin Name"], m["Risk"], m["Env"]), ("asset", "finding_title", "scanner_severity", "environment"))
+        self.assertEqual((m["Plugin Output"], m["Analyst Notes"], m["Status"]), ("capture.plugin_output", "claim.analyst_notes", "answer.status"))
+        self.assertEqual([r["finding_id"] for r in rows], ["ROW-0001", "ROW-0002", "ROW-0003"])  # no ID column: numbered
+        self.assertEqual(rows[0]["first_observed_utc"], "2026-03-15T14:02:00Z")
+        self.assertTrue(rows[2]["first_observed_utc"].startswith("2026-03-16T"))           # epoch seconds
+        self.assertIn("Caf\u00e9", rows[1]["claim.analyst_notes"])                         # Windows-1252 decoded
+        self.assertNotIn("Accepted risk", render_packet(rows[2]))                           # an existing verdict is hidden
+        self.assertEqual(priority(9.0, "prod"), priority(9.0, "production"))
+
+    def test_capture_columns_can_confirm_and_claim_columns_cannot(self):
+        with tempfile.TemporaryDirectory() as d:
+            row = read_findings(self._write(d, ",", "utf-8"))[0]
+        q1, q2 = 'GET /search?q=1%27%20OR%201=1--', '"note": "all customers returned"'
+        checks = [{"id": cid, "answer": "yes", "field": "capture.plugin_output", "quote": q2} for cid, _ in RUBRICS["Injection"]["checks"]]
+        ok = apply_gates(row, _test_assessment("Confirmed", [("capture.plugin_output", q1), ("capture.plugin_output", q2)], checklist=checks))
+        self.assertEqual(ok["classification"], "Confirmed")
+        claim_only = apply_gates(row, _test_assessment("Confirmed", [("claim.analyst_notes", "Dev team says WAF blocks this")], checklist=checks))
+        self.assertEqual(claim_only["classification"], "Needs Review")
+
+    def test_model_column_mapping_is_validated_by_code(self):
+        headers = ["Ref", "Weird Col", "Other", "Ghost"]
+        rows = [{"Ref": "A", "Weird Col": "x", "Other": "y", "Ghost": ""}]
+        answer = {"columns": [{"column": "Weird Col", "role": "asset"}, {"column": "Other", "role": "asset"},
+                              {"column": "Ghost", "role": "made_up_role"}, {"column": "Not A Column", "role": "capture"}]}
+        m = infer_mapping(headers, rows, FakeLLM(lambda s, msg: answer))
+        self.assertEqual(m["Ref"], "finding_id")                       # alias rule, never re-asked
+        self.assertEqual(m["Weird Col"], "asset")
+        self.assertEqual(m["Other"], "context.other")                  # a canonical role is used at most once
+        self.assertEqual(m["Ghost"], "context.ghost")                  # an unknown role falls back to context
+        self.assertNotIn("Not A Column", m)
+
+    def test_column_map_override_wins_and_is_checked(self):
+        m = infer_mapping(["Host", "Blob"], [{"Host": "h", "Blob": "b"}], override={"Blob": "capture.blob"})
+        self.assertEqual(m["Blob"], "capture.blob")
+        with self.assertRaises(InputError):
+            infer_mapping(["Host"], [{"Host": "h"}], override={"Host": "not_a_role"})
+
+    def test_any_csv_produces_valid_reports_and_filled_copy(self):
+        q1, q2 = 'GET /search?q=1%27%20OR%201=1--', '"note": "all customers returned"'
+        def responder(stage, msg):
+            if "ROW-0001" in msg:
+                checks = [{"id": cid, "answer": "yes", "field": "capture.plugin_output", "quote": q2} for cid, _ in RUBRICS["Injection"]["checks"]]
+                return _test_assessment("Confirmed", [("capture.plugin_output", q1), ("capture.plugin_output", q2)],
+                                        vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N", checklist=checks)
+            return _test_assessment("Needs Review", [], conf=0.5, observed=False, checklist=[])
+        with tempfile.TemporaryDirectory() as d:
+            src = self._write(d)
+            rows = read_findings(src)
+            results = run(rows, FakeLLM(responder), workers=1)
+            pages = (build_report(results, src.name, "fake", correlate_chains(results), "Acme"),
+                     build_client_report(results, src.name, (), "Acme", {r["finding_id"]: r for r in rows}),
+                     build_client_markdown(results, src.name, "Acme"))
+            n = write_filled_input(Path(d) / "filled.csv", src, results, rows)
+            with open(Path(d) / "filled.csv", newline="", encoding="utf-8") as fh:
+                filled = list(csv.DictReader(fh))
+        self.assertEqual([r["classification"] for r in results], ["Confirmed", "Needs Review", "Needs Review"])
+        for page in pages:
+            self.assertIn("10.0.0.5", page)
+            self.assertNotRegex(page, r"<td>None</td>|<code>None</code>|\bNone \u00b7|: None\b")  # no empty value printed as None
+        self.assertEqual(report_style_issues(pages[0]) + report_style_issues(pages[1]), [])
+        self.assertEqual((n, list(filled[0])[:len(self.HEADERS)]), (3, self.HEADERS))     # original columns kept
+        self.assertEqual(filled[0]["candidate_classification"], "Confirmed")
+
+
+class TestFactChecker(unittest.TestCase):
+    """The Fact-checker may only narrow client text; it never invents, never touches verdicts or scores."""
+
+    def _setup(self, answers):
+        row = _test_row()
+        res = assess_row(row, FakeLLM(lambda s, m: _test_assessment("Confirmed", GOOD_QUOTES)))
+        res["business_impact"] = "Tenant B read tenant A's vehicle record. This exposes every customer's billing history."
+        calls = iter(answers)
+        llm = FakeLLM(lambda s, m: next(calls))
+        return row, res, llm
+
+    @staticmethod
+    def _answer(status, quote="", impact=""):
+        return {"claims": [{"field": "business_impact", "claim": "c", "status": status, "quote": quote, "note": ""}],
+                "revised_title": "", "revised_impact": impact}
+
+    def test_supported_claim_with_real_quote_passes_unchanged(self):
+        row, res, llm = self._setup([self._answer("supported", GOOD_QUOTES[0][1])])
+        before = res["business_impact"]
+        log = fact_check([res], {row["finding_id"]: row}, llm)
+        self.assertEqual(log[0]["status"], "passed")
+        self.assertEqual(res["business_impact"], before)
+
+    def test_record_facts_such_as_environment_count_as_support(self):
+        row, _, _ = self._setup([])
+        self.assertEqual(verify_claims(row, self._answer("supported", row["environment"])["claims"])[0]["status"], "supported")
+        self.assertEqual(verify_claims(row, self._answer("supported", "Critical")["claims"])[0]["status"], "unsupported")
+
+    def test_quote_copied_with_packet_markup_still_counts(self):
+        row, _, _ = self._setup([])
+        q = f'<field name="environment">\n{row["environment"]}'
+        self.assertEqual(verify_claims(row, self._answer("supported", q)["claims"])[0]["status"], "supported")
+
+    def test_supported_label_with_invented_quote_counts_as_unsupported(self):
+        row, res, _ = self._setup([])
+        claims = verify_claims(row, self._answer("supported", "every customer's billing history is exposed")["claims"])
+        self.assertEqual(claims[0]["status"], "unsupported")
+
+    def test_unsupported_claim_is_rewritten_and_rechecked(self):
+        fixed = "Tenant B read tenant A's vehicle record."
+        row, res, llm = self._setup([self._answer("unsupported", impact=fixed), self._answer("supported", GOOD_QUOTES[0][1])])
+        verdict, score = res["classification"], res["cvss_score"]
+        log = fact_check([res], {row["finding_id"]: row}, llm)
+        self.assertEqual(log[0]["status"], "revised")
+        self.assertEqual(res["business_impact"], fixed)
+        self.assertEqual((res["classification"], res["cvss_score"]), (verdict, score))
+
+    def test_claim_still_unsupported_after_rewrite_is_flagged_for_a_person(self):
+        row, res, llm = self._setup([self._answer("unsupported", impact="Still says billing."), self._answer("unsupported")])
+        log = fact_check([res], {row["finding_id"]: row}, llm)
+        self.assertEqual(log[0]["status"], "flagged")
+        self.assertIn("held for review", build_report([res], "x.csv", "fake"))
+
+    def test_failed_fact_check_is_flagged_never_passed(self):
+        row, res, _ = self._setup([])
+        def boom(stage, message):
+            raise LLMError("timeout")
+        log = fact_check([res], {row["finding_id"]: row}, FakeLLM(boom))
+        self.assertEqual(log[0]["status"], "flagged")
+
 
 class TestClientReport(unittest.TestCase):
     def _results(self):
@@ -4003,9 +4944,11 @@ class TestClientReport(unittest.TestCase):
         a = self._results()[0]
         b = dict(a, finding_id="TF-7002", asset="other.example.test", environment="staging")
         c = dict(a, finding_id="TF-7003", asset="third.example.test", cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
-                 client_title="A different flaw of the same type")
+                 finding_title=a["finding_title"] + " (lookup)", client_title="A different flaw of the same type")
         page = build_client_report([a, b, c], "x.csv")
         self.assertEqual(page.count('<article class="entry'), 2)  # a+b together, c apart
+        # The technical report numbers the same issues the same way.
+        self.assertEqual(len(re.findall(r'<span class="fcode">F-\d+</span>', build_report([a, b, c], "x.csv", "fake"))), 2)
         for r in (a, b, c):
             self.assertEqual(page.count(f">{r['finding_id']}</button>"), 1)  # each instance listed exactly once
         self.assertIn("other.example.test", page)
@@ -4013,10 +4956,61 @@ class TestClientReport(unittest.TestCase):
     def test_summary_issue_and_finding_counts_reconcile(self):
         a = self._results()[0]
         rows = [dict(a, finding_id=f"TF-6{i:03d}", asset=f"svc{i}.example.test") for i in range(4)]
-        rows.append(dict(a, finding_id="TF-6900", cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", cvss_severity="Critical", cvss_score=9.8))
+        rows.append(dict(a, finding_id="TF-6900", finding_title="Another flaw", cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                         cvss_severity="Critical", cvss_score=9.8))
         page = build_client_report(rows, "x.csv")
         m = re.search(r"<tr class='tot'><td><b>Total</b></td><td class='n'>(\d+)</td><td class='n'>(\d+)</td>", page)
         self.assertEqual((m.group(1), m.group(2)), ("2", "5"))  # 2 distinct issues, 5 findings
+
+    def test_findings_and_systems_are_counted_separately(self):
+        a = self._results()[0]
+        rows = [dict(a, finding_id=f"TF-5{i:03d}") for i in range(3)]  # three records of one flaw on one system
+        page = build_client_report(rows, "x.csv")
+        self.assertIn("3 findings on 1 system", page)
+        self.assertNotIn("3 systems", page)
+
+    def test_fix_steps_starting_with_verify_are_not_mistaken_for_the_retest(self):
+        steps, _, verify = split_fix("Verify every token against the issuer key. Pin the algorithm. To verify, replay the forged token.")
+        self.assertEqual(len(steps), 2)
+        self.assertEqual(verify, ["To verify, replay the forged token."])
+
+    def test_editing_keeps_paths_and_uses_us_spelling(self):
+        out = plain_text("Repeat with a ../quarantine/x.txt member . The organisation behaviour was authorised.")
+        self.assertIn(" ../quarantine/x.txt member.", out)
+        self.assertIn("organization behavior was authorized", out)
+        self.assertIn("<code>/tmp/fl_probe</code>.", prose("wrote /tmp/fl_probe."))
+
+    def test_impact_names_the_attacker_the_vector_requires(self):
+        v = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H"
+        self.assertEqual(align_actor("Anyone who can reach the endpoint can run code.", v),
+                         "Any signed-in user who can reach the endpoint can run code.")
+        self.assertEqual(align_actor("Anyone who can reach it.", v.replace("PR:L", "PR:N")), "Anyone who can reach it.")
+        self.assertEqual(align_actor("Any caller who can reach it.", v), "Any signed-in user who can reach it.")
+        self.assertEqual(align_actor("Anyone who can reach it.", v, "PR:L because the credential requirement was not shown."),
+                         "An attacker who can reach it.")
+
+    def test_reports_make_no_network_requests(self):
+        res = self._results()
+        for page in (build_client_report(res, "x.csv"), build_report(res, "x.csv", "fake")):
+            self.assertNotRegex(page, r"<link[^>]+https?://|<script[^>]+src=|@import")
+
+    def test_reports_carry_client_reporting_company_and_assessor(self):
+        res = self._results()
+        pages = (build_report(res, "x.csv", "fake", (), "Acme Fleet", "Northwind Security", "Jordan Lee"),
+                 build_client_report(res, "x.csv", (), "Acme Fleet", None, "Northwind Security", "Jordan Lee"),
+                 build_client_markdown(res, "x.csv", "Acme Fleet", "Northwind Security", "Jordan Lee"))
+        for page in pages:
+            self.assertIn("Acme Fleet", page)
+            self.assertIn("Jordan Lee, Northwind Security", page)
+        bare = build_report(res, "x.csv", "fake", (), "Acme Fleet")
+        self.assertNotIn("Prepared by", bare)  # nothing is invented when the author is not given
+
+    def test_markdown_report_has_every_required_field(self):
+        res = self._results()
+        md = build_client_markdown(res, "x.csv")
+        for needle in ("## Top 3 priority issues", res[0]["cvss_vector"], str(res[0]["cvss_score"]), res[0]["asset"],
+                       "**Impact.**", "**Recommended fix.**", "**Evidence**"):
+            self.assertIn(needle, md)
 
     def test_every_confirmed_finding_appears_exactly_once(self):
         a = self._results()[0]
@@ -4069,7 +5063,6 @@ class TestClientReport(unittest.TestCase):
         res = self._results()
         res[0]["client_title"] = "<script>alert(1)</script>"
         self.assertNotIn("<script>alert(1)</script>", build_client_report(res, "x.csv"))
-
 
 
 if __name__ == "__main__":
