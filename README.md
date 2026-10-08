@@ -84,24 +84,25 @@ To be Confirmed a finding has to clear every gate. To land in Needs Review it on
 
 | Defence | What it does |
 |---|---|
-| **Verbatim quotes** | Every quote must appear in an evidence field of that row (whitespace and case normalised). Anything else is discarded |
-| **Real content** | A quote needs 16+ characters beyond the row's own IDs. Scanner labels are never evidence |
-| **Runtime proof** | Confirmed needs 2+ verified quotes, one from a capture. Claims and narrative alone count for nothing |
-| **Guided checklist** | Per-category rubric of three checks. Confirmed needs every check yes with a verified quote; a False Positive needs one check no |
-| **Boundary observed** | Both reviews must say the decisive boundary was observed, with confidence 0.6 or more |
+| **Quote verification** | Every quote must appear verbatim in an evidence field of that row (whitespace and case normalised), carry 16+ characters beyond the row's own IDs, and not come only from a scanner label. Anything else is discarded |
+| **Sufficient evidence** | Confirmed needs 2+ verified quotes, one from a capture. Claims and a tester's narrative alone count for nothing |
+| **Claims are not proof** | A False Positive cannot rest only on owner or ticket statements |
 | **Provenance** | A False Positive needs runtime evidence when the reviewed source is not shown to be the running revision |
+| **Guided checklist** | Per-category rubric of three checks, each answered with a quote. Confirmed needs every check yes; a False Positive needs one check no. A quote from a claim does not back an answer |
 | **Consistency** | Rows with identical evidence that got different answers all go to Needs Review |
 | **Failure routing** | A model error becomes Needs Review at confidence 0, never Confirmed |
+
+A model's own confidence and its own "boundary observed" flag are reported but are not gates: they describe the model's verdict, so a gate on them could only disagree with itself.
 
 The gates prove a quote exists and comes from the right kind of evidence, not that it means what a review says. That judgement is the models', which is why there are two blind reviews, an Arbiter, a consistency audit (`audit.json`) and a spot check before anything is sent.
 
 **Proof the gates run.** A gate that never fires looks the same as a gate that is off, so:
 
-- Every gate from 1 to 11 is evaluated on every finding and recorded in its `gate_trace`.
-- A **drill** plants one fault per gate (a fabricated quote, claims as the only proof, confidence 0.55, split verdicts, a failed model call…) and requires each gate to trip. It makes no model calls and runs at the start of every run; if any gate fails to trip, the run stops with exit code 4. `--gate-drill` runs it alone.
+- Every per-finding gate is evaluated on every finding and recorded in its `gate_trace`.
+- A **drill** plants one fault per gate (a fabricated quote, claims as the only proof, a checklist answer backed by a claim, split verdicts, a failed model call…) and requires each gate to trip. It makes no model calls and runs at the start of every run; if any gate fails to trip, the run stops with exit code 4. `--gate-drill` runs it alone.
 - The console, `run_summary.json` and the analyst report show how often each gate was evaluated and fired.
 
-On real data the models' own judgement already clears the gates (the first 25 findings of the 350-row file triggered none, even with the gate rules removed from the prompt), so a zero in the table means the evidence passed. Details and numbers are in [GATES_AND_AGENTS.md](GATES_AND_AGENTS.md#proof-that-the-gates-run).
+On real data the models' own judgement already clears most gates, so a zero in the table usually means the evidence passed. The tightened checklist gate is the exception: replaying saved reviews, it moves 3 findings from Confirmed to Needs Review because a decisive check rested only on an owner or ticket claim. Details are in [GATES_AND_AGENTS.md](GATES_AND_AGENTS.md#proof-that-the-gates-run).
 
 ## Scoring and fix order
 
@@ -162,7 +163,7 @@ A permanent refusal (model not found, no access) moves the call to the fallback 
 ## Limitations
 
 - **Bounded by the evidence.** No host is contacted. Thin exports land in Needs Review with the missing evidence named.
-- **Gates check provenance, not meaning**, and gates 9 and 10 compare a model's answers with its own verdict, so they only fire if it contradicts itself.
+- **Gates check provenance, not meaning.** They prove a quote is real and from the right kind of evidence, not that it supports the claim made from it.
 - **CVSS vectors are model judgements.** The voting rule makes each result reproducible from the saved reviews, but fresh runs can vote differently on a debatable metric. The analyst report records every split.
 - **The Fact-checker catches unsupported claims, not wrong inferences.** The analyst report lists every claim and its status.
 - **Provenance facts read particular formats** (`revision=<hex>` in source, `image-source-revision` in the manifest, the release-bot note, `X-Request-ID` and `request_id` correlation). On other exports they come out empty and the models read provenance unaided.
