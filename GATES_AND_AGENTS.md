@@ -34,9 +34,9 @@ observation, `claim` as an assertion, `label` as an untrusted scanner label.
 
 | # | Gate | Applies to | Downgrades to Needs Review when | Code |
 |---|---|---|---|---|
-| 1 | **Quote verification** | Every verdict | A cited quote is not a verbatim substring of a quotable field (whitespace and case normalised). Rejected quotes are discarded and noted | `verify_citations`, `locate_quote` |
-| 2 | **Identifier-only quotes** | Every verdict | A quote has fewer than 16 characters of content beyond the row's own request or finding ID | `locate_quote` |
-| 3 | **Labels are not evidence** | Every verdict | A quote comes only from scanner labels (severity, rule, title, IDs, dates) | `quotable_fields` |
+| 1 | **Quote verification** | Every verdict | A cited quote is not a verbatim substring of a quotable field (whitespace and case normalised). Rejected quotes are discarded and noted. The verdict only moves if too few good quotes remain (gates 4 to 6) | `verify_citations`, `locate_quote` |
+| 2 | **Identifier-only quotes** | Every verdict | A quote has fewer than 16 characters of content beyond the row's own request or finding ID. Discarded like gate 1 | `locate_quote`, `quote_problem` |
+| 3 | **Labels are not evidence** | Every verdict | A quote comes only from scanner labels (severity, rule, title, IDs, dates). Discarded like gate 1 | `quotable_fields`, `quote_problem` |
 | 4 | **Minimum citations** | Confirmed | Fewer than 2 quotes survive verification | `apply_gates` |
 | 5 | **Runtime evidence** | Confirmed | No verified quote comes from runtime evidence (a capture or a test account) | `is_runtime` |
 | 6 | **Capture behind the narrative** | Confirmed | The only runtime support is someone's description of a test, with no captured request, response, tool output, log or trace | `is_capture` |
@@ -82,6 +82,34 @@ verbatim quote; an unknown carries none. Code re-verifies every checklist quote 
 check becomes unknown, so a disagreement on a decisive check prevents Confirmed. When the Arbiter decides, its own
 checklist is used. A finding no rubric fits is not checklist-gated.
 
+## Proof that the gates run
+
+A gate that never fires looks the same as a gate that is switched off. Three things separate the two.
+
+- **Every gate runs on every finding.** `apply_gates` computes the condition of gates 1 to 11 for each finding, whatever
+  its verdict, and stores a `gate_trace` on the result: for each gate, whether it applies to that verdict, whether its
+  condition was met and whether it fired. Gate 12 runs across the whole file and gate 13 on every model failure.
+- **Gate activity is reported.** The console, `run_summary.json` (`gate_activity`) and the "Gate activity" table in
+  the analyst report list, per gate, how many findings it was evaluated on and how many it acted on.
+- **A drill trips every gate before every run.** `gate_drill` feeds each gate the fault it exists to catch (a
+  fabricated quote, an identifier-only quote, a quote copied from a scanner label, one citation, claims as the only
+  support, narrative with no capture, a dismissal resting on an owner claim, source that is not the running revision,
+  an unobserved boundary, an all-unknown checklist, confidence 0.55, split verdicts on identical evidence, a failed
+  model call) and checks that the gate fired and the verdict became Needs Review. A clean control must fire nothing.
+  The drill makes no model calls. It runs at the start of every run, its result is written to `gate_drill.json`, and
+  if any gate fails to trip the run stops with exit code 4 before assessing a finding. `python3 triage.py --gate-drill`
+  runs it alone.
+
+**What the real runs show.** On the first 25 findings of the 350-row file, assessed with fresh model calls, no gate
+downgraded any verdict. This also held when the sentences that restate the gate rules (the confidence floor, the
+citation minimum, the checklist requirement) were removed from the models' prompt. The models' own judgment already
+met every gate's condition: decisive verdicts carried confidence of 0.70 or more, at least four verified quotes, a
+backed checklist and an observed boundary, and they sent weak cases to Needs Review themselves. Gates 9 and 10 compare
+a model's answers with its own verdict, so they only fire if a model contradicts itself. Gates 1 to 3 fire on a
+hallucinated quote, which did not occur. Only the consistency gate has fired on real data (2 findings in the 350-row
+run). A zero in the activity table therefore means the evidence passed, and the drill shows the gate would have caught
+a failure.
+
 ## Scoring rules
 
 Owned by the Scorekeeper. None of them can change a verdict.
@@ -122,7 +150,7 @@ wrong, so the analyst report shows every claim and its status.
 python3 triage.py --self-test
 ```
 
-The 84 offline tests cover every gate and rule above, including fabricated quotes, claim-only evidence, unobserved
+The 89 offline tests cover every gate and rule above, including fabricated quotes, claim-only evidence, unobserved
 boundaries, low confidence, source-only dismissals, split equivalent rows, the checklist, the per-metric vote, the
 Fact-checker and arbitrary CSV formats.
 
