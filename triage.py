@@ -22,6 +22,7 @@ import html
 import io
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -924,18 +925,33 @@ def normalise(text: str) -> str:
     return _WS.sub(" ", (text or "")).strip().lower()
 
 
+def _content_beyond_ids(row: Dict[str, str], quote: str) -> str:
+    """The quote with the row's own request and finding IDs taken out, normalised."""
+    content = normalise(quote)
+    for ident in (row.get("request_id"), row.get("finding_id")):
+        if ident:
+            content = content.replace(normalise(ident), "")
+    return content.strip(" :=-\"'")
+
+
 def locate_quote(row: Dict[str, str], quote: str) -> List[str]:
     """Return the evidence fields that contain `quote` (whitespace-normalised,
     case-insensitive). A quote must carry at least MIN_QUOTE_CHARS of content
     beyond the row's own identifiers: quoting a request ID proves nothing."""
-    q = normalise(quote)
-    content = q
-    for ident in (row.get("request_id"), row.get("finding_id")):
-        if ident:
-            content = content.replace(normalise(ident), "")
-    if len(content.strip(" :=-\"'")) < MIN_QUOTE_CHARS:
+    if len(_content_beyond_ids(row, quote)) < MIN_QUOTE_CHARS:
         return []
+    q = normalise(quote)
     return [f for f in quotable_fields(row) if q in normalise(row[f])]
+
+
+def quote_problem(row: Dict[str, str], quote: str) -> str:
+    """Why a quote that locate_quote rejected is not usable: 'identifier' (gate 2), 'label' (gate 3) or 'missing' (gate 1)."""
+    if len(_content_beyond_ids(row, quote)) < MIN_QUOTE_CHARS:
+        return "identifier"
+    q = normalise(quote)
+    if any(q in normalise(row[f]) for f in row if field_kind(f) == "label"):
+        return "label"
+    return "missing"
 
 
 # ============================================================================
@@ -1433,6 +1449,27 @@ _COMMON_RULES = """
     min_conf=MIN_DECISIVE_CONFIDENCE, min_cites=MIN_CITATIONS_CONFIRMED, min_chars=MIN_QUOTE_CHARS,
     metadata=", ".join(sorted(METADATA_FIELDS)), runtime=", ".join(sorted(RUNTIME_FIELDS)))
 
+def _ablate_gate_rules(rules: str) -> str:
+    """Experiment only (TRIAGE_ABLATE_GATE_RULES=1): drop the sentences that tell the reviews what the gates require,
+    so the gates see the reviews' unprompted behaviour. Never set in a normal run."""
+    cuts = [
+        (" If you would rate a Confirmed or False Positive below %s, it is Needs Review." % MIN_DECISIVE_CONFIDENCE, ""),
+        ("\n  Confirmed needs every check answered yes with a quote. False Positive needs at least one check answered no with\n"
+         "  a quote that shows the condition absent on the deployed path.", ""),
+        ("- Provide %d-6 citations." % MIN_CITATIONS_CONFIRMED, "- Provide up to 6 citations."),
+        (" Citations are machine-verified against the packet; fabricated or paraphrased quotes cause automatic\n  downgrade.", ""),
+    ]
+    for old, new in cuts:
+        assert old in rules, old[:50]
+        rules = rules.replace(old, new)
+    rules, n = re.subn(r"- For Confirmed, at least one citation must come from a runtime field.*?(?=\n\n|\n# )", "", rules, flags=re.S)
+    assert n == 1
+    return rules
+
+
+if os.environ.get("TRIAGE_ABLATE_GATE_RULES") == "1":
+    _COMMON_RULES = _ablate_gate_rules(_COMMON_RULES)
+
 CLASSIFIER_SYSTEM = (
     "You are a senior application-security adjudicator triaging one raw scanner finding for the client. "
     "Your job is to decide what the evidence actually proves.\n"
@@ -1853,7 +1890,8 @@ def verify_citations(row: Dict[str, str], citations: List[dict]) -> Tuple[List[d
 
 def verify_checklist(row: Dict[str, str], checklist: List[dict]) -> List[dict]:
     """One entry per rubric check, in rubric order. A yes or no only counts as `backed` when its quote is found
-    verbatim in the row; a missing or repeated check id is treated as unknown."""
+    verbatim in the row and does not come from a claim (an owner or ticket statement is not proof either way);
+    a missing or repeated check id is treated as unknown."""
     rubric = rubric_for(row.get("category") or row.get("finding_title", ""))
     if not rubric:
         return []
@@ -1865,8 +1903,9 @@ def verify_checklist(row: Dict[str, str], checklist: List[dict]) -> List[dict]:
         c = given.get(cid) or {}
         answer = c.get("answer") if c.get("answer") in ("yes", "no") else "unknown"
         hit = next(iter(verify_citations(row, [c])[0]), {}) if answer != "unknown" else {}
-        out.append({"id": cid, "check": text, "answer": answer, "backed": bool(hit),
-                    "field": hit.get("field", ""), "quote": hit.get("quote", "")})
+        claim = bool(hit) and is_claim(hit.get("field", ""))
+        out.append({"id": cid, "check": text, "answer": answer, "backed": bool(hit) and not claim,
+                    "from_claim": claim, "field": hit.get("field", ""), "quote": hit.get("quote", "")})
     return out
 
 
@@ -1890,19 +1929,40 @@ def checklist_reason(category: str, cls: str, checks: List[dict]) -> Optional[st
         missing = [c for c in checks if not (c["answer"] == "yes" and c["backed"])]
         if missing:
             return (f"{len(missing)} of {len(checks)} checks for {category.lower()} findings have no quoted evidence "
-                    f"showing the vulnerable condition")
+                    f"showing the vulnerable condition (an owner or ticket claim does not count)")
     elif cls == "False Positive":
         if not any(c["answer"] == "no" and c["backed"] for c in checks):
-            return f"no check for {category.lower()} findings has quoted evidence showing the condition is absent"
+            return (f"no check for {category.lower()} findings has quoted evidence showing the condition is absent "
+                    f"(an owner or ticket claim does not count)")
     return None
+
+
+_ALL_VERDICTS = ("Confirmed", "False Positive", "Needs Review")
+_DECISIVE = ("Confirmed", "False Positive")
+# (id, name, verdicts the gate can act on). Gates 1 to 5 run inside apply_gates on every finding and record a trace
+# entry each time; 6 runs across the whole file; 7 runs when a model call fails.
+GATES: List[Tuple[int, str, Tuple[str, ...]]] = [
+    (1, "Quote verification", _ALL_VERDICTS), (2, "Sufficient evidence", ("Confirmed",)),
+    (3, "Claims are not proof", ("False Positive",)), (4, "Revision provenance", ("False Positive",)),
+    (5, "Guided checklist", _DECISIVE), (6, "Consistency gate", _ALL_VERDICTS), (7, "Failure routing", _ALL_VERDICTS),
+]
+PER_FINDING_GATES = 5
+GATE_NAMES = {gid: name for gid, name, _ in GATES}
+GATE_SCOPE = {gid: scope for gid, _, scope in GATES}
 
 
 def apply_gates(row: Dict[str, str], assessment: dict, extra_citations: List[dict] = ()) -> dict:
     """Return a new dict with classification/confidence possibly downgraded and
     `gate_notes`, `gate_reasons`, `gated_from`, `verified_evidence`,
-    `rejected_evidence` populated."""
+    `rejected_evidence` and `gate_trace` populated.
+
+    Every per-finding gate evaluates its condition on every finding, whatever the verdict. `gate_trace` records, per
+    gate, whether it applies to this verdict, whether its condition was met and whether it fired (applies and met).
+    Only checks the code can make against the row are gates: a model's own confidence and its own claim that the
+    boundary was observed are reported but never decide a verdict."""
     a = dict(assessment)
-    verified, rejected = verify_citations(row, list(a.get("evidence", [])) + list(extra_citations))
+    given = list(a.get("evidence", [])) + list(extra_citations)
+    verified, rejected = verify_citations(row, given)
     # Both assessors often cite the same text, or a fragment of a sentence the other cited in full.
     # Keep the longest form of each; order follows the first citation.
     texts = [normalise(v["quote"]) for v in verified]
@@ -1911,6 +1971,7 @@ def apply_gates(row: Dict[str, str], assessment: dict, extra_citations: List[dic
     notes: List[str] = []
     if rejected:
         notes.append(f"{len(rejected)} cited quote(s) not found verbatim in the row and were discarded")
+    problems = collections.Counter(quote_problem(row, c.get("quote", "")) for c in rejected)
 
     cls = a.get("classification")
     conf = float(a.get("confidence", 0.0))
@@ -1918,36 +1979,53 @@ def apply_gates(row: Dict[str, str], assessment: dict, extra_citations: List[dic
     has_runtime = any(is_runtime(f) for f in cited)
     has_capture = any(is_capture(f) for f in cited)  # request, response, exchange, log, trace or tool output
     facts = extract_facts(row)
-    reasons: List[str] = []
+    checks = verify_checklist(row, a.get("checklist", []))
+    why = checklist_reason(row.get("category") or "this type of", cls, checks)
 
+    # Each condition is computed for every finding; `applies` decides whether it can change this verdict.
+    quote_detail = ", ".join(f"{n} {what}" for n, what in ((problems["missing"], "not in the row"),
+                                                           (problems["identifier"], "only an identifier"),
+                                                           (problems["label"], "from scanner labels")) if n)
+    met = {
+        1: (sum(problems.values()) > 0, f"{sum(problems.values())} of {len(given)} quote(s) discarded: {quote_detail}"),
+        2: (len(verified) < MIN_CITATIONS_CONFIRMED or not has_capture,
+            f"{len(verified)} verified of {MIN_CITATIONS_CONFIRMED} required; "
+            f"{'a capture is cited' if has_capture else 'no captured request, response, log or trace is cited'}"),
+        3: (all(is_claim(f) for f in cited), "every verified quote is a claim or ticket comment"),
+        4: (bool(facts.get("release_bot_image_differs_from_source")
+                 or facts.get("source_revision_matches_manifest") is False) and not has_runtime,
+            "source not tied to the running revision and no runtime quote"),
+        5: (why is not None, why or ""),
+    }
+    trace = []
+    for gid, name, scope in GATES[:PER_FINDING_GATES]:
+        applies = cls in scope
+        condition, detail = met[gid]
+        trace.append({"id": gid, "name": name, "applies": applies, "condition_met": bool(condition),
+                      "fired": bool(condition and applies), "detail": detail if condition else ""})
+    fired = {t["id"] for t in trace if t["fired"]}
+
+    reasons: List[str] = []
     if cls == "Confirmed":
-        if not a.get("boundary_observed"):
-            reasons.append("the evidence does not show the security boundary actually being crossed")
-        if len(verified) < MIN_CITATIONS_CONFIRMED:
-            reasons.append(f"too little of the cited evidence could be found in the source data "
-                           f"({len(verified)} of the {MIN_CITATIONS_CONFIRMED} items required)")
-        if not has_runtime:
-            reasons.append("none of the supporting evidence comes from testing the running service")
-        elif not has_capture:
-            reasons.append("the supporting evidence is the analyst's description of the test, with no captured request, "
-                           "response, log or trace behind it")
+        if 2 in fired:
+            if len(verified) < MIN_CITATIONS_CONFIRMED:
+                reasons.append(f"too little of the cited evidence could be found in the source data "
+                               f"({len(verified)} of the {MIN_CITATIONS_CONFIRMED} items required)")
+            if not has_runtime:
+                reasons.append("none of the supporting evidence comes from testing the running service")
+            elif not has_capture:
+                reasons.append("the supporting evidence is the analyst's description of the test, with no captured "
+                               "request, response, log or trace behind it")
     elif cls == "False Positive":
-        if not a.get("boundary_observed"):
-            reasons.append("the evidence does not show the control actually blocking the attack")
-        if all(is_claim(f) for f in cited):
+        if 3 in fired:
             reasons.append("the case for dismissal rests only on owner or ticket statements")
-        if (facts.get("release_bot_image_differs_from_source") or facts.get("source_revision_matches_manifest") is False) \
-                and not has_runtime:
+        if 4 in fired:
             reasons.append("the reviewed source is not shown to be the running revision, "
                            "and no test of the running service shows the control in place")
     elif cls != "Needs Review":
         reasons.append(f"unknown classification {cls!r}")
-    checks = verify_checklist(row, a.get("checklist", []))
-    why = checklist_reason(row.get("category") or "this type of", cls, checks)
-    if why:
+    if 5 in fired:
         reasons.append(why)
-    if cls in ("Confirmed", "False Positive") and conf < MIN_DECISIVE_CONFIDENCE:
-        reasons.append("the evidence is not strong enough to decide it either way")
 
     if reasons:
         notes.append(f"downgraded {cls} -> Needs Review: " + "; ".join(reasons))
@@ -1960,6 +2038,7 @@ def apply_gates(row: Dict[str, str], assessment: dict, extra_citations: List[dic
     a["rejected_evidence"] = rejected
     a["gate_notes"] = notes
     a["gate_reasons"] = reasons
+    a["gate_trace"] = trace
     return a
 
 
@@ -2150,6 +2229,7 @@ def assess_row(row: Dict[str, str], llm: LLMBackend, context: Optional[Dict[str,
         "compensating_controls": gated.get("compensating_controls", ""),
         "missing_evidence": missing,
         "checklist": gated["verified_checklist"],
+        "gate_trace": gated["gate_trace"],
         "evidence": gated["verified_evidence"],
         "rejected_evidence": gated["rejected_evidence"],
         "assessor_agreement": agreement,
@@ -2187,7 +2267,7 @@ def _failed(base: dict, error: str, **assessments) -> Dict[str, object]:
         "reasoning": f"Automated assessment could not complete; routed to human review. ({error[:300]})",
         "decisive_boundary": "", "missing_evidence": "Automated assessment failed; manual review required.",
         "evidence": [], "rejected_evidence": [], "assessor_agreement": "error", "adjudicated": False,
-        "gated_from": None, "gate_notes": "pipeline error -> Needs Review", "error": error,
+        "gated_from": None, "gate_notes": "pipeline error -> Needs Review", "error": error, "gate_trace": [],
         "assessments": assessments, **_UNSCORED,
     })
     return out
@@ -2276,6 +2356,107 @@ def consistency_gate(rows: List[Dict[str, str]], results: List[Dict[str, object]
             m.update(_UNSCORED)
             polish_result(m)
     return actions
+
+
+def gate_activity(results: Sequence[dict]) -> List[dict]:
+    """How often each gate ran and acted in this run, from the per-finding traces and the notes the file-wide gates leave.
+
+    `evaluated` counts the findings the gate's condition was computed on; `fired` counts the findings it changed or
+    would have changed (it applies to the verdict and its condition was met)."""
+    assessed = [r for r in results if not r.get("error")]
+    traced = [r for r in assessed if r.get("gate_trace")]
+    out = []
+    for gid, name, _ in GATES:
+        if gid <= PER_FINDING_GATES:
+            evaluated = len(traced)
+            fired = sum(1 for r in traced for t in r["gate_trace"] if t["id"] == gid and t["fired"])
+        elif gid == 6:
+            evaluated = len(assessed)
+            fired = sum(1 for r in assessed if "consistency gate" in (r.get("gate_notes") or ""))
+        else:
+            evaluated, fired = len(results), len(results) - len(assessed)
+        out.append({"id": gid, "name": name, "evaluated": evaluated, "fired": fired})
+    return out
+
+
+def _drill_cases() -> List[Tuple[int, str, Dict[str, str], dict]]:
+    """Faults for each gate, as (gate, what is wrong, row, assessment), plus a clean control as gate 0."""
+    ident_row = _test_row(raw_http_exchange="> X-Request-ID: req_712f86a919b9\n< HTTP/1.1 200", request_id="req_712f86a919b9")
+    label_row = _test_row(scanner_rule="Broken object level authorization on vehicle endpoint")
+    mismatch_row = _test_row(source_code_excerpt="cur.execute('SELECT id FROM fleets WHERE org_id = %s', (org_id,))",
+                             ticket_comment_thread="[release-bot 11:41] candidate image differs from source attachment=true")
+    narrative_row = _test_row(validation_attempt="Two cross-tenant attempts returned tenant A rows in the seeded test")
+    claims = [("claimed_compensating_controls", "Owner says a downstream ownership check exists"),
+              ("ticket_comment_thread", "please downgrade; UI does not expose this parameter")]
+    narrative = [("observation", "Tenant B session retrieved tenant A vehicle record 4411"),
+                 ("validation_attempt", "Two cross-tenant attempts returned tenant A rows")]
+    fp_source = [("source_code_excerpt", "SELECT id FROM fleets WHERE org_id = %s")]
+    first_check = RUBRICS["Authorization"]["checks"][0][0]
+    claim_answer = ("yes", *claims[0])
+    claim_checks = {cid: ("no", *claims[0]) for cid, _ in RUBRICS["Authorization"]["checks"]}
+    return [
+        (0, "no fault: a well-evidenced Confirmed", _test_row(), _test_assessment("Confirmed", GOOD_QUOTES)),
+        (1, "a quote that is not in the row", _test_row(),
+         _test_assessment("Confirmed", [GOOD_QUOTES[0], ("raw_response", "HTTP/1.1 200 attacker downloaded /etc/shadow")])),
+        (1, "a quote that is only the request ID", ident_row,
+         _test_assessment("Confirmed", [("raw_http_exchange", "X-Request-ID: req_712f86a919b9")] + GOOD_QUOTES[:1])),
+        (1, "a quote copied from a scanner label", label_row,
+         _test_assessment("Confirmed", [("scanner_rule", "Broken object level authorization on vehicle endpoint")] + GOOD_QUOTES[:1])),
+        (2, "one verified quote where two are required", _test_row(), _test_assessment("Confirmed", GOOD_QUOTES[:1])),
+        (2, "Confirmed on claims alone", _test_row(), _test_assessment("Confirmed", claims)),
+        (2, "Confirmed on the analyst's narrative, no capture", narrative_row, _test_assessment("Confirmed", narrative)),
+        (3, "False Positive on an owner claim alone", _test_row(), _test_assessment("False Positive", claims[:1])),
+        (4, "False Positive on source that is not the running revision", mismatch_row,
+         _test_assessment("False Positive", fp_source)),
+        (5, "Confirmed with every checklist answer unknown", _test_row(),
+         _test_assessment("Confirmed", GOOD_QUOTES, checklist=_test_checklist("Needs Review"))),
+        (5, "Confirmed with one checklist yes backed only by a claim", _test_row(),
+         _test_assessment("Confirmed", GOOD_QUOTES, checklist=_test_checklist("Confirmed", **{first_check: claim_answer}))),
+        (5, "False Positive whose every checklist no is backed only by a claim", _test_row(),
+         _test_assessment("False Positive", GOOD_QUOTES, checklist=_test_checklist("False Positive", **claim_checks))),
+    ]
+
+
+def gate_drill() -> List[dict]:
+    """Offline proof that every gate trips. Each case feeds a gate the fault it exists to catch and checks that the
+    gate fired and the verdict moved to Needs Review; a clean control checks that nothing fires without a fault.
+    Needs no model calls, so it runs at the start of every run."""
+    cases = []
+    for gid, fault, row, assessment in _drill_cases():
+        g = apply_gates(row, assessment)
+        fired = [t["id"] for t in g["gate_trace"] if t["fired"]]
+        ok = (not fired and g["classification"] == assessment["classification"]) if gid == 0 else \
+             (gid in fired and g["classification"] == "Needs Review")
+        cases.append({"gate": gid, "name": GATE_NAMES.get(gid, "Control"), "fault": fault, "fired": fired,
+                      "verdict": g["classification"], "ok": ok})
+    twin_a = _test_row(finding_id="DRILL-1")
+    twin_b = dict(twin_a, finding_id="DRILL-2", request_id="req_other")
+    ids = {"DRILL-1": "False Positive", "DRILL-2": "Confirmed"}
+    res = [assess_row(r, FakeLLM(lambda s, m: _test_assessment("Needs Review", GOOD_QUOTES, conf=0.5)))
+           for r in (twin_a, twin_b)]
+    for r in res:
+        r.update(classification=ids[r["finding_id"]], confidence=0.8)
+    actions = consistency_gate([twin_a, twin_b], res)
+    cases.append({"gate": 6, "name": GATE_NAMES[6], "fault": "identical evidence classified differently",
+                  "fired": [6] if actions else [], "verdict": "/".join(r["classification"] for r in res),
+                  "ok": len(actions) == 2 and all(r["classification"] == "Needs Review" for r in res)})
+
+    def broken(stage: str, message: str) -> dict:
+        raise LLMError("drill: model unavailable")
+    failed = assess_row(_test_row(finding_id="DRILL-3"), FakeLLM(broken))
+    cases.append({"gate": 7, "name": GATE_NAMES[7], "fault": "the model call fails",
+                  "fired": [7] if failed.get("error") else [], "verdict": failed["classification"],
+                  "ok": bool(failed.get("error")) and failed["classification"] == "Needs Review" and failed["confidence"] == 0.0})
+    return cases
+
+
+def print_gate_table(activity: Sequence[dict], drill: Sequence[dict]) -> None:
+    """Console summary: for each gate, the drill result and how often it ran and acted in this run."""
+    tripped = {g: all(c["ok"] for c in drill if c["gate"] == g) for g in {c["gate"] for c in drill}}
+    print("\nGates (drill = a planted fault trips the gate; evaluated / fired = this run):")
+    for g in activity:
+        mark = "ok  " if tripped.get(g["id"]) else "FAIL"
+        print(f"  {g['id']:>2}  {g['name']:<30} drill {mark}  evaluated {g['evaluated']:>4}  fired {g['fired']:>3}")
 
 
 # ---------------------------------------------------------------------------
@@ -3435,6 +3616,13 @@ def build_report(results: List[dict], source_name: str, model: str, chains: List
     errors = sum(1 for r in results if r.get("error"))
     consistency = sum(1 for r in results if "consistency gate" in (r.get("gate_notes") or ""))
     evidence_gated = gated - consistency
+    drill_ok = {c["gate"]: c["ok"] for c in gate_drill()}
+    gate_table_html = ("<table class='grid'><thead><tr><th>Gate</th><th>Name</th><th>Evaluated</th><th>Fired</th>"
+                       "<th>Drill</th></tr></thead><tbody>"
+                       + "".join(f"<tr><td>{g['id']}</td><td>{e(g['name'])}</td><td>{g['evaluated'] or 'not recorded'}</td>"
+                                 f"<td>{g['fired'] if g['evaluated'] else ''}</td>"
+                                 f"<td>{'tripped' if drill_ok.get(g['id']) else 'DID NOT TRIP'}</td></tr>"
+                                 for g in gate_activity(results)) + "</tbody></table>")
     n_conf_chains = sum(1 for c in chains if c["status"] == "confirmed")
     window, date_note = _observed(results)
     report_date = _fmt_date(dt.date.today())
@@ -3607,11 +3795,15 @@ def build_report(results: List[dict], source_name: str, model: str, chains: List
 <h2 id="method">Assessment Method and Limitations</h2>
 <ul>
 <li><b>Two independent reviews per finding.</b> The second review did not see the first and was set up to challenge both outcomes. {"Where they disagreed on the outcome or on any CVSS metric, a third review voted; " + _plural(adjudicated, "finding needed", "findings needed") + " this." if adjudicated else "The two reviews reached the same outcome on every finding, so no third review was needed."}</li>
-<li><b>Evidence must be checkable.</b> Confirmed needs at least {MIN_CITATIONS_CONFIRMED} verified citations including runtime evidence, and the deciding step must have been observed. {_plural(evidence_gated, "verdict was", "verdicts were") if evidence_gated else "No verdicts were"} downgraded to Needs Review by these checks.</li>
+<li><b>Evidence must be checkable.</b> Confirmed needs at least {MIN_CITATIONS_CONFIRMED} verified citations including a captured runtime observation, and every category check answered yes with a quote from the evidence (an owner or ticket claim does not count). {_plural(evidence_gated, "verdict was", "verdicts were") if evidence_gated else "No verdicts were"} downgraded to Needs Review by these checks.</li>
 <li><b>Consistency check.</b> Findings with the same scenario and evidence must get the same answer. Where findings with identical evidence received different verdicts, the decisive ones were moved to Needs Review ({_plural(consistency, "finding", "findings")}).</li>
 <li><b>Claims are not controls.</b> Owner statements, claimed protections and missing log entries are never treated as proof. Source, manifest and runtime records are matched by revision and date before being combined.</li>
 <li><b>Scoring.</b> CVSS 3.1 vectors are chosen from the evidence and scores computed by the published formula. Priority = CVSS &times; environment weight. Fix now is 7.0 or above, Plan a fix 3.0 or above, Backlog below that. Model confidence is reported but does not change the order.</li>
 <li><b>Limits.</b> Assessment uses only the supplied evidence. Reviews were carried out by AI models (models and call counts: {e(model)}) under the code checks above; a person remains responsible for every outcome. {_plural(errors, "finding", "findings") + " could not be reviewed and" if errors else "No findings failed review, and none"} {"is" if errors == 1 else "are"} listed as needs review for that reason.</li></ul>
+
+<h3>Gate activity</h3>
+<p>Every gate ran on every finding. <i>Evaluated</i> is the number of findings the gate's condition was computed on; <i>fired</i> is the number it acted on. A gate that fired nothing found nothing wrong in this run. The drill column shows that a planted fault does trip the gate, so zero here means the evidence was sound, not that the gate is switched off.</p>
+<div class="tablewrap">{gate_table_html}</div>
 
 <h2 id="appendix" class="noprint">Appendix: Every Finding (on-screen only)</h2>
 <div class="noprint"><div class="filters"><input id="q" placeholder="Filter by ID, system, title, reasoning..." aria-label="Filter findings">
@@ -4061,6 +4253,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--column-map", type=Path, help="JSON object mapping source columns to roles; overrides the inferred mapping")
     ap.add_argument("--rebuild-reports", action="store_true",
                     help="rebuild both HTML reports from the saved out/assessments.jsonl; no model calls")
+    ap.add_argument("--gate-drill", action="store_true",
+                    help="plant a fault for every gate, check each one trips, and exit (no model calls; also runs at the start of every run)")
     ap.add_argument("--self-test", action="store_true", help="run the built-in test suite and exit")
     return ap
 
@@ -4078,6 +4272,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.self_test:
         result = unittest.main(module=__name__, argv=[sys.argv[0]], exit=False, verbosity=2).result
         return 0 if result.wasSuccessful() else 1
+
+    if args.gate_drill:
+        drill = gate_drill()
+        print_gate_table([{"id": g, "name": n, "evaluated": 0, "fired": 0} for g, n, _ in GATES], drill)
+        bad = [c for c in drill if not c["ok"]]
+        print(f"\n{len(drill) - len(bad)} of {len(drill)} drill cases behaved as expected")
+        return 4 if bad else 0
 
     if args.rebuild_reports:
         return rebuild_reports(args.out, args.csv.name if args.csv else "findings CSV", args.csv,
@@ -4121,6 +4322,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     client, company, tester = report_parties(args)  # asked before the long run, not after it
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
+    drill = gate_drill()  # before any model call: a gate that cannot trip stops the run
+    (out / "gate_drill.json").write_text(json.dumps(drill, indent=1), encoding="utf-8")
+    broken_gates = [c for c in drill if not c["ok"]]
+    print(f"[gate drill] {len(drill) - len(broken_gates)} of {len(drill)} planted faults tripped the gate they target")
+    if broken_gates:
+        print("error: gate drill failed for " + ", ".join(f"gate {c['gate']} ({c['name']})" for c in broken_gates)
+              + "; see gate_drill.json. No findings were assessed.", file=sys.stderr)
+        return 4
 
 
     print(f"Assessing {len(rows)} findings from {csv_path.name} with {llm.model} ({args.workers} workers)")
@@ -4180,6 +4389,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
              "llm_calls": llm.stats.calls, "cache_hits": llm.stats.cache_hits, "failures": llm.stats.failures, "rows_failed": errors,
              "cost_usd_this_run": round(llm.stats.cost_usd, 2), "elapsed_s": round(time.time() - t0, 1),
              "consistency_audit": {k: audit[k] for k in ("scenario_groups", "split_groups", "minority_rows")},
+             "gate_drill": {"cases": len(drill), "tripped": sum(1 for c in drill if c["ok"])},
+             "gate_activity": gate_activity(results),
              "fact_check": dict(collections.Counter(f["status"] for f in facts_log)) if facts_log else "skipped"}
     (out / "run_summary.json").write_text(json.dumps(stats, indent=1), encoding="utf-8")
     page = build_report(results, csv_path.name, model_desc, chains, client, company, tester)
@@ -4193,6 +4404,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if leftover:
         print(f"WARNING: report prose still contains: {', '.join(leftover)}", file=sys.stderr)
     print(json.dumps(stats, indent=1))
+    print_gate_table(stats["gate_activity"], drill)
     print(f"Wrote {out}/: classified_findings.csv, findings_report.html, client_report.html, client_report.md, assessments.jsonl, attack_chains.json, audit.json, run_summary.json")
     for m, why in llm.disabled.items():
         print(f"NOTICE: {m} was unavailable ({why[:120]}); fallback model(s) answered instead - see run_summary.json",
@@ -4321,13 +4533,26 @@ class TestEvidenceGates(unittest.TestCase):
                                      ("ticket_comment_thread", "please downgrade; UI does not expose this parameter")])
         self.assertEqual(apply_gates(_test_row(), a)["classification"], "Needs Review")
 
-    def test_confirmed_when_boundary_not_observed_becomes_needs_review(self):
-        a = _test_assessment("Confirmed", GOOD_QUOTES, observed=False)
-        self.assertEqual(apply_gates(_test_row(), a)["classification"], "Needs Review")
+    def test_a_models_own_boundary_flag_and_confidence_are_reported_but_never_decide(self):
+        # Both are the model describing its own verdict, so neither is a gate; the checks on the evidence decide.
+        for kw in ({"observed": False}, {"conf": 0.55}):
+            g = apply_gates(_test_row(), _test_assessment("Confirmed", GOOD_QUOTES, **kw))
+            self.assertEqual(g["classification"], "Confirmed", kw)
+            self.assertEqual([t["id"] for t in g["gate_trace"] if t["fired"]], [], kw)
 
-    def test_low_confidence_confirmed_becomes_needs_review(self):
-        self.assertEqual(apply_gates(_test_row(), _test_assessment("Confirmed", GOOD_QUOTES, conf=0.55))["classification"],
-                         "Needs Review")
+    def test_checklist_answer_backed_only_by_a_claim_does_not_count(self):
+        first = RUBRICS["Authorization"]["checks"][0][0]
+        claim = ("claimed_compensating_controls", "Owner says a downstream ownership check exists")
+        conf = _test_assessment("Confirmed", GOOD_QUOTES, checklist=_test_checklist("Confirmed", **{first: ("yes", *claim)}))
+        g = apply_gates(_test_row(), conf)
+        self.assertEqual((g["classification"], g["gated_from"]), ("Needs Review", "Confirmed"))
+        self.assertTrue(any(c["from_claim"] and not c["backed"] for c in g["verified_checklist"]))
+        no_claims = {cid: ("no", *claim) for cid, _ in RUBRICS["Authorization"]["checks"]}
+        fp = _test_assessment("False Positive", GOOD_QUOTES, checklist=_test_checklist("False Positive", **no_claims))
+        self.assertEqual(apply_gates(_test_row(), fp)["classification"], "Needs Review")
+        one_real = dict(no_claims, **{first: ("no", *CHECK_QUOTE)})
+        fp_ok = _test_assessment("False Positive", GOOD_QUOTES, checklist=_test_checklist("False Positive", **one_real))
+        self.assertEqual(apply_gates(_test_row(), fp_ok)["classification"], "False Positive")
 
     def test_well_evidenced_confirmed_survives(self):
         g = apply_gates(_test_row(), _test_assessment("Confirmed", GOOD_QUOTES))
@@ -4342,6 +4567,41 @@ class TestEvidenceGates(unittest.TestCase):
         a = _test_assessment("Confirmed", [("observation", "Tenant B   session\nretrieved tenant A vehicle"),
                                      ("raw_response", '{"vehicle":4411,"org":"tenant-a"}')])
         self.assertEqual(apply_gates(_test_row(), a)["classification"], "Confirmed")
+
+
+class TestGateCoverage(unittest.TestCase):
+    def test_every_per_finding_gate_is_traced_for_every_verdict(self):
+        for cls in ("Confirmed", "False Positive", "Needs Review"):
+            g = apply_gates(_test_row(), _test_assessment(cls, GOOD_QUOTES))
+            self.assertEqual([t["id"] for t in g["gate_trace"]], list(range(1, PER_FINDING_GATES + 1)), cls)
+
+    def test_a_gate_only_fires_for_the_verdicts_it_applies_to(self):
+        g = apply_gates(_test_row(), _test_assessment("Needs Review", GOOD_QUOTES[:1], conf=0.4))
+        self.assertEqual([t["id"] for t in g["gate_trace"] if t["fired"]], [])
+        self.assertTrue(any(t["condition_met"] for t in g["gate_trace"]))  # computed, but not applicable to Needs Review
+
+    def test_drill_trips_every_gate_and_the_clean_control_fires_nothing(self):
+        cases = gate_drill()
+        self.assertEqual(sorted({c["gate"] for c in cases}), list(range(0, len(GATES) + 1)))
+        self.assertEqual([c for c in cases if not c["ok"]], [])
+        self.assertEqual([c["fired"] for c in cases if c["gate"] == 0], [[]])
+
+    def test_drill_reports_a_gate_that_stops_working(self):
+        real = verify_citations
+        try:
+            globals()["verify_citations"] = lambda row, cites: (list(cites or []), [])  # nothing is ever rejected
+            broken = [c["gate"] for c in gate_drill() if not c["ok"]]
+        finally:
+            globals()["verify_citations"] = real
+        self.assertIn(1, broken)
+
+    def test_gate_activity_counts_evaluations_and_firings(self):
+        llm = FakeLLM(lambda s, m: _test_assessment("Confirmed", GOOD_QUOTES[:1]))
+        res = [assess_row(_test_row(), llm)]
+        activity = {g["id"]: g for g in gate_activity(res)}
+        self.assertEqual((activity[2]["evaluated"], activity[2]["fired"]), (1, 1))  # one verified quote, two required
+        self.assertEqual((activity[5]["evaluated"], activity[5]["fired"]), (1, 0))
+        self.assertEqual(activity[7]["fired"], 0)
 
 
 class TestReviewRegressions(unittest.TestCase):
