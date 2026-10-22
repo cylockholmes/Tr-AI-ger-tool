@@ -12,7 +12,7 @@ The rule behind all of it: **models read and judge, and code verifies and decide
 
 ## Run it
 
-You need Python 3.9+ and the [Claude Code](https://claude.com/claude-code) CLI (`claude`) on your `PATH`, logged in. There are no pip packages.
+You need Python 3.9+ and the Claude Code CLI (`claude`) on your `PATH`, logged in. There are no pip packages.
 
 ```bash
 python3 triage.py --csv findings.csv --client-name "Acme Corp"
